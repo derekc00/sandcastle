@@ -198,7 +198,7 @@ start_container() {
   fi
 
   # Give container enough memory for Claude Code
-  docker_args+=(--memory=4g)
+  docker_args+=(--memory=12g)
 
   # Mount ~/.claude/ for settings/skills (read-only)
   if [[ -d "$HOME/.claude" ]]; then
