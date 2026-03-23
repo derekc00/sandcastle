@@ -328,6 +328,7 @@ ${prompt_content}"
       cd /home/agent/repos/${REPO}
       claude -p \"\$(cat /tmp/sandcastle-prompt.md)\" \
         --dangerously-skip-permissions \
+        --model sonnet \
         --output-format text \
         2>/dev/null || true
     " 2>/dev/null | tee "$output_file" || true
