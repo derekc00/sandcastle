@@ -167,6 +167,16 @@ start_container() {
 
   info "Starting container: ${CONTAINER_NAME}..."
 
+  # Extract Claude Code OAuth token from macOS Keychain
+  local claude_token=""
+  if command -v security &>/dev/null; then
+    local creds_json
+    creds_json=$(security find-generic-password -s "Claude Code-credentials" -a "$(whoami)" -w 2>/dev/null || true)
+    if [[ -n "$creds_json" ]]; then
+      claude_token=$(echo "$creds_json" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)
+    fi
+  fi
+
   local docker_args=(
     -d
     --name "$CONTAINER_NAME"
@@ -174,15 +184,22 @@ start_container() {
     -e "GITHUB_REPO=${GITHUB_REPO}"
   )
 
+  # Pass Claude auth token extracted from keychain
+  if [[ -n "$claude_token" ]]; then
+    docker_args+=(-e "ANTHROPIC_API_KEY=${claude_token}")
+    info "Using Claude subscription token from keychain"
+  else
+    warn "Could not extract Claude token from keychain — Claude may not be authenticated"
+  fi
+
   # Pass project-specific env vars from .env if it exists
   if [[ -f "$SANDCASTLE_DIR/.env" ]]; then
     docker_args+=(--env-file "$SANDCASTLE_DIR/.env")
   fi
 
-  # Mount ~/.claude/ for subscription auth
+  # Mount ~/.claude/ for settings/skills (read-only)
   if [[ -d "$HOME/.claude" ]]; then
     docker_args+=(-v "$HOME/.claude:/home/agent/.claude:ro")
-    info "Mounting ~/.claude/ for subscription auth"
   fi
 
   docker run "${docker_args[@]}" "$IMAGE_NAME" \
