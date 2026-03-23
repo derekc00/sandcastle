@@ -212,27 +212,77 @@ ${prompt_content}"
     prompt_file=$(mktemp /tmp/sandcastle-prompt-XXXXXX.md)
     echo "$full_prompt" > "$prompt_file"
 
-    # Start heartbeat in background — prints elapsed time every 60s
     local iter_start=$SECONDS
+
+    # Start heartbeat in background — fallback if stream-json is quiet
     (
       while true; do
-        sleep 60
+        sleep 120
         local elapsed=$(( SECONDS - iter_start ))
         local mins=$(( elapsed / 60 ))
-        echo -e "\033[0;34m  [heartbeat] ${mins}m elapsed — agent still running...\033[0m"
+        echo -e "\033[0;34m  [heartbeat] ${mins}m elapsed\033[0m"
       done
     ) &
     local heartbeat_pid=$!
 
     info "Running agent..."
 
-    # Run Claude in Docker Sandbox
+    # Run Claude in Docker Sandbox with stream-json for live activity feed
     local output_file="/tmp/sandcastle-output-${i}.txt"
+    local result_file="/tmp/sandcastle-result-${i}.txt"
+    > "$output_file"
+    > "$result_file"
+
     docker sandbox run claude -- \
       --permission-mode acceptEdits \
       -p "$(cat "$prompt_file")" \
       --model sonnet \
-      2>&1 | tee "$output_file" || true
+      --output-format stream-json \
+      2>&1 | while IFS= read -r line; do
+        # Save raw output
+        echo "$line" >> "$output_file"
+
+        # Parse JSON events into live status
+        local msg_type tool_name file_path cmd_text result_text
+
+        msg_type=$(echo "$line" | jq -r 'type as $t | if $t == "object" then (.type // empty) else empty end' 2>/dev/null) || continue
+
+        case "$msg_type" in
+          tool_use)
+            tool_name=$(echo "$line" | jq -r '.name // .tool // empty' 2>/dev/null)
+            case "$tool_name" in
+              Read|NotebookRead)
+                file_path=$(echo "$line" | jq -r '.input.file_path // empty' 2>/dev/null)
+                [[ -n "$file_path" ]] && echo -e "  \033[0;34m[reading]\033[0m  ${file_path##*/}"
+                ;;
+              Write)
+                file_path=$(echo "$line" | jq -r '.input.file_path // empty' 2>/dev/null)
+                [[ -n "$file_path" ]] && echo -e "  \033[0;32m[writing]\033[0m  ${file_path##*/}"
+                ;;
+              Edit)
+                file_path=$(echo "$line" | jq -r '.input.file_path // empty' 2>/dev/null)
+                [[ -n "$file_path" ]] && echo -e "  \033[0;33m[editing]\033[0m  ${file_path##*/}"
+                ;;
+              Bash)
+                cmd_text=$(echo "$line" | jq -r '.input.command // empty' 2>/dev/null | head -c 80)
+                [[ -n "$cmd_text" ]] && echo -e "  \033[0;35m[running]\033[0m  ${cmd_text}"
+                ;;
+              Glob|Grep)
+                local pattern
+                pattern=$(echo "$line" | jq -r '.input.pattern // empty' 2>/dev/null)
+                [[ -n "$pattern" ]] && echo -e "  \033[0;34m[search]\033[0m   ${pattern}" || echo -e "  \033[0;34m[search]\033[0m"
+                ;;
+              TaskCreate|TaskUpdate)
+                echo -e "  \033[0;36m[task]\033[0m"
+                ;;
+            esac
+            ;;
+          result)
+            result_text=$(echo "$line" | jq -r '.result // empty' 2>/dev/null)
+            [[ -n "$result_text" ]] && echo "$result_text" > "$result_file"
+            ;;
+        esac
+      done || true
 
     # Stop heartbeat
     kill "$heartbeat_pid" 2>/dev/null || true
@@ -268,13 +318,14 @@ ${prompt_content}"
       echo "$new_commits" | sed 's/^/  /'
     fi
 
-    # Check for COMPLETE signal
-    if grep -q '<promise>COMPLETE</promise>' "$output_file" 2>/dev/null; then
-      rm -f "$output_file"
+    # Check for COMPLETE signal in result or raw output
+    if grep -q '<promise>COMPLETE</promise>' "$result_file" 2>/dev/null || \
+       grep -q '<promise>COMPLETE</promise>' "$output_file" 2>/dev/null; then
+      rm -f "$output_file" "$result_file"
       success "All tasks complete!"
       break
     fi
-    rm -f "$output_file"
+    rm -f "$output_file" "$result_file"
 
     # Safety net: auto-commit any uncommitted work
     if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
