@@ -322,7 +322,7 @@ ${prompt_content}"
     # Write prompt to file inside container (avoids bash escaping issues with large prompts)
     echo "$full_prompt" | docker exec -i "$CONTAINER_NAME" bash -c "cat > /tmp/sandcastle-prompt.md"
 
-    # Run Claude inside container — stream output directly (no capture)
+    # Run Claude inside container — stream output directly
     local output_file="/tmp/sandcastle-output-${i}.txt"
     docker exec "$CONTAINER_NAME" bash -c "
       cd /home/agent/repos/${REPO}
@@ -330,8 +330,8 @@ ${prompt_content}"
         --dangerously-skip-permissions \
         --model sonnet \
         --output-format text \
-        2>/dev/null || true
-    " 2>/dev/null | tee "$output_file" || true
+        2>&1 || true
+    " 2>&1 | tee "$output_file" || true
 
     # Check for COMPLETE signal
     if grep -q '<promise>COMPLETE</promise>' "$output_file" 2>/dev/null; then
