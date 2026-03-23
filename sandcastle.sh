@@ -319,25 +319,26 @@ ${prompt_content}"
       continue
     fi
 
-    # Run Claude inside container
-    output=$(docker exec "$CONTAINER_NAME" bash -c "
+    # Write prompt to file inside container (avoids bash escaping issues with large prompts)
+    echo "$full_prompt" | docker exec -i "$CONTAINER_NAME" bash -c "cat > /tmp/sandcastle-prompt.md"
+
+    # Run Claude inside container — stream output directly (no capture)
+    local output_file="/tmp/sandcastle-output-${i}.txt"
+    docker exec "$CONTAINER_NAME" bash -c "
       cd /home/agent/repos/${REPO}
-      claude -p '$(echo "$full_prompt" | sed "s/'/'\\\\''/g")' \
+      claude -p \"\$(cat /tmp/sandcastle-prompt.md)\" \
         --dangerously-skip-permissions \
         --output-format text \
         2>/dev/null || true
-    " 2>/dev/null) || true
-
-    # Display Claude's output
-    if [[ -n "$output" ]]; then
-      echo "$output"
-    fi
+    " 2>/dev/null | tee "$output_file" || true
 
     # Check for COMPLETE signal
-    if echo "$output" | grep -q '<promise>COMPLETE</promise>'; then
+    if grep -q '<promise>COMPLETE</promise>' "$output_file" 2>/dev/null; then
+      rm -f "$output_file"
       success "All tasks complete!"
       break
     fi
+    rm -f "$output_file"
 
     # Push commits
     docker exec "$CONTAINER_NAME" bash -c "
