@@ -17,11 +17,27 @@ OWNER=""
 BRANCH=""
 ITERATIONS=100
 MAX_TURNS=75
+TIMEOUT_MINS=30
 MILESTONE=""
 MILESTONE_FILTER=""
 RUN_ALL=false
 DRY_RUN=false
 SINGLE_ISSUE=""
+HEARTBEAT_PID=""
+
+# --- Cleanup on exit ---
+
+cleanup() {
+  # Kill heartbeat if running
+  if [[ -n "$HEARTBEAT_PID" ]]; then
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
+    wait "$HEARTBEAT_PID" 2>/dev/null || true
+  fi
+  # Kill any orphan heartbeat subshells from this script
+  pkill -P $$ 2>/dev/null || true
+  rm -f .sandcastle/issues.json .sandcastle/ralph-commits.txt
+}
+trap cleanup EXIT INT TERM
 
 # --- Helpers ---
 
@@ -52,6 +68,7 @@ preflight() {
   if [[ -f "$SANDCASTLE_DIR/config.json" ]]; then
     ITERATIONS=$(jq -r '.defaultIterations // 100' "$SANDCASTLE_DIR/config.json")
     MAX_TURNS=$(jq -r '.maxTurns // 75' "$SANDCASTLE_DIR/config.json")
+    TIMEOUT_MINS=$(jq -r '.timeoutMinutes // 30' "$SANDCASTLE_DIR/config.json")
   fi
 }
 
@@ -248,7 +265,8 @@ run_loop() {
 
     local iter_start=$SECONDS
 
-    # Start heartbeat
+    # Kill any previous heartbeat, start a new one
+    [[ -n "$HEARTBEAT_PID" ]] && kill "$HEARTBEAT_PID" 2>/dev/null || true
     (
       while true; do
         sleep 60
@@ -257,13 +275,13 @@ run_loop() {
         echo -e "\033[0;34m  [heartbeat] ${mins}m elapsed — agent still running...\033[0m"
       done
     ) &
-    local heartbeat_pid=$!
+    HEARTBEAT_PID=$!
 
-    info "Running agent... (${MAX_TURNS} max turns)"
+    info "Running agent... (${TIMEOUT_MINS}m timeout, ${MAX_TURNS} max turns)"
 
-    # Run Claude in Docker Sandbox
+    # Run Claude in Docker Sandbox with timeout
     local result
-    result=$(docker sandbox run claude \
+    result=$(timeout "${TIMEOUT_MINS}m" docker sandbox run claude \
       --dangerously-skip-permissions \
       --model sonnet \
       --max-turns "${MAX_TURNS}" \
@@ -271,10 +289,17 @@ run_loop() {
 ONLY WORK ON A SINGLE TASK. \
 Use 'gh issue view #N' to read the full details of the issue you pick. \
 If all tasks are complete, output <promise>COMPLETE</promise>." \
-      2>&1) || true
+      2>&1)
+    local exit_code=$?
 
     # Stop heartbeat
-    kill "$heartbeat_pid" 2>/dev/null || true
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
+    wait "$HEARTBEAT_PID" 2>/dev/null || true
+    HEARTBEAT_PID=""
+
+    if [[ "$exit_code" -eq 124 ]]; then
+      warn "Iteration timed out after ${TIMEOUT_MINS}m — moving on"
+    fi
     wait "$heartbeat_pid" 2>/dev/null || true
 
     # Show Claude's output (last 50 lines to avoid flooding)
@@ -461,6 +486,7 @@ main() {
 
   echo "Repo:       ${OWNER}/${REPO}"
   echo "Iterations: ${ITERATIONS}"
+  echo "Timeout:    ${TIMEOUT_MINS}m per iteration"
   echo "Max turns:  ${MAX_TURNS} per iteration"
   echo ""
 
