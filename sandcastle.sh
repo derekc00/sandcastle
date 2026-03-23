@@ -341,10 +341,15 @@ ${prompt_content}"
     fi
     rm -f "$output_file"
 
-    # Push commits
+    # Safety net: if Claude made changes but forgot to commit, do it here
     docker exec "$CONTAINER_NAME" bash -c "
       cd /home/agent/repos/${REPO}
-      git push origin '${BRANCH}' 2>/dev/null || true
+      if [ -n \"\$(git status --porcelain)\" ]; then
+        echo '[sandcastle] Auto-committing uncommitted changes...'
+        git add -A
+        git commit -m 'RALPH: auto-commit uncommitted work from iteration ${i}'
+      fi
+      git push origin '${BRANCH}' 2>&1 || true
     " || true
 
   done
