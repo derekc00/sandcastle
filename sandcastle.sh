@@ -215,18 +215,26 @@ run_loop() {
     ) &
     local heartbeat_pid=$!
 
-    info "Running agent..."
+    # Read timeout from config (default 20 minutes)
+    local timeout_mins
+    timeout_mins=$(jq -r '.timeoutMinutes // 20' "$SANDCASTLE_DIR/config.json" 2>/dev/null || echo 20)
 
-    # Run Claude in Docker Sandbox — matches AI Hero guide pattern exactly
-    # Key: use @file references so Claude reads files itself, keep prompt tiny
+    info "Running agent... (${timeout_mins}m timeout)"
+
+    # Run Claude in Docker Sandbox with timeout
     local result
-    result=$(docker sandbox run claude \
+    result=$(timeout "${timeout_mins}m" docker sandbox run claude \
       --permission-mode acceptEdits \
       --model sonnet \
       -p "@.sandcastle/prompt.md @.sandcastle/issues.json @.sandcastle/ralph-commits.txt \
 ONLY WORK ON A SINGLE TASK. \
 If all tasks are complete, output <promise>COMPLETE</promise>." \
       2>&1) || true
+
+    local exit_code=$?
+    if [[ "$exit_code" -eq 124 ]]; then
+      warn "Iteration timed out after ${timeout_mins}m — moving to next iteration"
+    fi
 
     # Stop heartbeat
     kill "$heartbeat_pid" 2>/dev/null || true
