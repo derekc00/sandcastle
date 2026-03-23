@@ -206,7 +206,7 @@ ${prompt_content}"
 
     # Run Claude in Docker Sandbox — handles auth, mounts, and isolation automatically
     local output_file="/tmp/sandcastle-output-${i}.txt"
-    docker sandbox run claude \
+    docker sandbox run claude -- \
       --permission-mode acceptEdits \
       -p "$(cat "$prompt_file")" \
       --model sonnet \
