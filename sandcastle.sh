@@ -165,13 +165,13 @@ fetch_ralph_commits() {
 run_loop() {
   local prompt_content
   prompt_content=$(cat "$SANDCASTLE_DIR/prompt.md")
+  local loop_start_time=$SECONDS
 
   for i in $(seq 1 "$ITERATIONS"); do
     echo ""
-    echo "=== Iteration ${i}/${ITERATIONS} ==="
+    echo "=== Iteration ${i}/${ITERATIONS} === $(date '+%H:%M:%S') ==="
     echo ""
 
-    info "Running agent..."
     local issues commits full_prompt
 
     issues=$(fetch_issues)
@@ -184,6 +184,14 @@ run_loop() {
       success "No open issues remaining. Done."
       break
     fi
+
+    # Show issue titles for visibility
+    info "Issues available: ${issue_count}"
+    echo "$issues" | jq -r 'if type == "array" then .[:5][] | "  #\(.number) \(.title)"  else "#\(.number) \(.title)" end' 2>/dev/null || true
+    if [[ "$issue_count" -gt 5 ]]; then
+      echo "  ... and $((issue_count - 5)) more"
+    fi
+    echo ""
 
     # Construct prompt
     full_prompt="# ISSUES JSON
@@ -204,7 +212,21 @@ ${prompt_content}"
     prompt_file=$(mktemp /tmp/sandcastle-prompt-XXXXXX.md)
     echo "$full_prompt" > "$prompt_file"
 
-    # Run Claude in Docker Sandbox — handles auth, mounts, and isolation automatically
+    # Start heartbeat in background — prints elapsed time every 60s
+    local iter_start=$SECONDS
+    (
+      while true; do
+        sleep 60
+        local elapsed=$(( SECONDS - iter_start ))
+        local mins=$(( elapsed / 60 ))
+        echo -e "\033[0;34m  [heartbeat] ${mins}m elapsed — agent still running...\033[0m"
+      done
+    ) &
+    local heartbeat_pid=$!
+
+    info "Running agent..."
+
+    # Run Claude in Docker Sandbox
     local output_file="/tmp/sandcastle-output-${i}.txt"
     docker sandbox run claude -- \
       --permission-mode acceptEdits \
@@ -212,7 +234,39 @@ ${prompt_content}"
       --model sonnet \
       2>&1 | tee "$output_file" || true
 
+    # Stop heartbeat
+    kill "$heartbeat_pid" 2>/dev/null || true
+    wait "$heartbeat_pid" 2>/dev/null || true
+
     rm -f "$prompt_file"
+
+    # Show iteration summary
+    local iter_elapsed=$(( SECONDS - iter_start ))
+    local iter_mins=$(( iter_elapsed / 60 ))
+    local iter_secs=$(( iter_elapsed % 60 ))
+    echo ""
+    info "Iteration ${i} completed in ${iter_mins}m ${iter_secs}s"
+
+    # Show what changed
+    local changed_files
+    changed_files=$(git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
+    local new_commits
+    new_commits=$(git log --oneline -3 --since="$(( iter_elapsed + 10 )) seconds ago" 2>/dev/null || true)
+
+    if [[ -n "$changed_files" ]]; then
+      local file_count
+      file_count=$(echo "$changed_files" | wc -l | tr -d '[:space:]')
+      info "Files changed: ${file_count}"
+      echo "$changed_files" | head -5 | sed 's/^/  /'
+      if [[ "$file_count" -gt 5 ]]; then
+        echo "  ... and $((file_count - 5)) more"
+      fi
+    fi
+
+    if [[ -n "$new_commits" ]]; then
+      info "Recent commits:"
+      echo "$new_commits" | sed 's/^/  /'
+    fi
 
     # Check for COMPLETE signal
     if grep -q '<promise>COMPLETE</promise>' "$output_file" 2>/dev/null; then
@@ -224,13 +278,19 @@ ${prompt_content}"
 
     # Safety net: auto-commit any uncommitted work
     if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-      echo '[sandcastle] Auto-committing uncommitted changes...'
+      warn "Auto-committing uncommitted changes..."
       git add -A
       git commit -m "RALPH: auto-commit uncommitted work from iteration ${i}"
     fi
 
     # Push after each iteration
     git push origin "${BRANCH}" 2>&1 || true
+
+    # Show total elapsed
+    local total_elapsed=$(( SECONDS - loop_start_time ))
+    local total_mins=$(( total_elapsed / 60 ))
+    echo ""
+    info "Total elapsed: ${total_mins}m | Next: iteration $((i + 1))/${ITERATIONS}"
 
   done
 }
