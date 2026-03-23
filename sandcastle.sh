@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # sandcastle — autonomous AI development loop
-# Uses Docker Sandbox + Claude Code to implement GitHub issues
+# Uses Docker Sandbox + ralph-loop plugin for iterative development
 
 # Colors
 RED='\033[0;31m'
@@ -16,28 +16,11 @@ REPO=""
 OWNER=""
 BRANCH=""
 ITERATIONS=100
-MAX_TURNS=75
-TIMEOUT_MINS=30
 MILESTONE=""
 MILESTONE_FILTER=""
 RUN_ALL=false
 DRY_RUN=false
 SINGLE_ISSUE=""
-HEARTBEAT_PID=""
-
-# --- Cleanup on exit ---
-
-cleanup() {
-  # Kill heartbeat if running
-  if [[ -n "$HEARTBEAT_PID" ]]; then
-    kill "$HEARTBEAT_PID" 2>/dev/null || true
-    wait "$HEARTBEAT_PID" 2>/dev/null || true
-  fi
-  # Kill any orphan heartbeat subshells from this script
-  pkill -P $$ 2>/dev/null || true
-  rm -f .sandcastle/issues.json .sandcastle/ralph-commits.txt
-}
-trap cleanup EXIT INT TERM
 
 # --- Helpers ---
 
@@ -67,8 +50,6 @@ preflight() {
   # Read config
   if [[ -f "$SANDCASTLE_DIR/config.json" ]]; then
     ITERATIONS=$(jq -r '.defaultIterations // 100' "$SANDCASTLE_DIR/config.json")
-    MAX_TURNS=$(jq -r '.maxTurns // 75' "$SANDCASTLE_DIR/config.json")
-    TIMEOUT_MINS=$(jq -r '.timeoutMinutes // 30' "$SANDCASTLE_DIR/config.json")
   fi
 }
 
@@ -159,214 +140,125 @@ setup_branch() {
   success "On branch ${BRANCH}"
 }
 
-# --- Issue Fetching ---
+# --- Prepare Context ---
 
-fetch_issues_summary() {
-  # Only fetch number + title (lightweight) for the issue list
-  # Claude will use `gh issue view #N` to read the full body of whichever it picks
+prepare_context() {
+  info "Preparing issue context..."
+
+  # Fetch issues (lightweight: number + title only)
   local issue_args="--state open --json number,title,labels --limit 10"
-
   if [[ -n "$MILESTONE_FILTER" ]]; then
     issue_args="$issue_args --milestone \"${MILESTONE_FILTER}\""
   fi
 
+  local issues
   if [[ -n "$SINGLE_ISSUE" ]]; then
-    gh issue view "${SINGLE_ISSUE}" --json number,title,body,labels 2>/dev/null
+    issues=$(gh issue view "${SINGLE_ISSUE}" --json number,title,body,labels 2>/dev/null)
+  else
+    issues=$(eval "gh issue list ${issue_args}" 2>/dev/null)
+  fi
+
+  local commits
+  commits=$(git log --grep='RALPH:' --oneline -10 --format='%h %ad %s' --date=short 2>/dev/null || echo "No RALPH commits yet")
+
+  # Write to .sandcastle/ (Docker sandbox mounts the working dir)
+  echo "$issues" > .sandcastle/issues.json
+  echo "$commits" > .sandcastle/ralph-commits.txt
+
+  local issue_count
+  issue_count=$(echo "$issues" | jq 'if type == "array" then length else 1 end' 2>/dev/null || echo "0")
+  info "Issues: ${issue_count} | RALPH commits: $(echo "$commits" | wc -l | tr -d '[:space:]')"
+}
+
+# --- Build Prompt ---
+
+build_prompt() {
+  # Read the static prompt template
+  local prompt_content
+  prompt_content=$(cat "$SANDCASTLE_DIR/prompt.md")
+
+  # The prompt for /ralph-loop — Claude reads the files itself
+  cat <<EOF
+$prompt_content
+
+# CONTEXT FILES
+Read these files for current state:
+- .sandcastle/issues.json — open GitHub issues (use 'gh issue view #N' for full details)
+- .sandcastle/ralph-commits.txt — recent RALPH commits showing completed work
+
+ONLY WORK ON A SINGLE TASK.
+Use 'gh issue view #N' to read the full details of the issue you pick.
+Commit with RALPH: prefix. Close the issue when done.
+Push your commits with 'git push origin ${BRANCH}'.
+EOF
+}
+
+# --- Run Loop ---
+
+run_loop() {
+  local prompt
+  prompt=$(build_prompt)
+
+  if [[ "$DRY_RUN" == true ]]; then
+    info "[DRY RUN] Would run ralph-loop with prompt:"
+    echo "$prompt" | head -20
+    echo "..."
     return
   fi
 
-  eval "gh issue list ${issue_args}" 2>/dev/null
+  echo ""
+  echo "=== Starting Ralph Loop ==="
+  echo ""
+  echo "Iterations: ${ITERATIONS}"
+  echo "Branch:     ${BRANCH}"
+  echo ""
+  info "Launching Docker sandbox with ralph-loop plugin..."
+  info "You'll see Claude's output in real-time below."
+  echo ""
+
+  # Run Claude in Docker Sandbox — single session, ralph-loop plugin handles the loop
+  # The Stop hook intercepts exit and feeds the same prompt back.
+  # Context persists between iterations (files + git history).
+  # Output streams in real-time (it's a normal Claude session, not -p mode).
+  docker sandbox run claude \
+    --dangerously-skip-permissions \
+    --model sonnet \
+    -p "/ralph-loop ${prompt} --max-iterations ${ITERATIONS} --completion-promise 'COMPLETE'" \
+    2>&1 || true
+
+  echo ""
+  success "Ralph loop finished."
 }
 
-fetch_ralph_commits() {
-  git log --grep='RALPH:' --oneline -10 --format='%h %ad %s' --date=short 2>/dev/null || echo "No RALPH commits yet"
-}
+# --- Post-Loop ---
 
-# --- Quality Gate ---
+post_loop() {
+  # Clean up temp files
+  rm -f .sandcastle/issues.json .sandcastle/ralph-commits.txt
 
-run_quality_gate() {
-  info "Running quality gate..."
-
-  local failed=false
-
-  # Detect and run typecheck
-  if [[ -f "tsconfig.json" ]]; then
-    if command -v npx &>/dev/null; then
-      echo -n "  typecheck... "
-      if npx tsc --noEmit 2>&1 | tail -3; then
-        echo "  typecheck passed"
-      else
-        warn "  typecheck FAILED"
-        failed=true
-      fi
-    fi
+  # Auto-commit any leftover uncommitted work
+  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    warn "Auto-committing uncommitted changes..."
+    git add -A
+    git commit -m "RALPH: auto-commit final uncommitted work"
   fi
 
-  # Detect and run tests (quick check, not full suite)
-  if [[ -f "package.json" ]]; then
-    local test_cmd
-    test_cmd=$(jq -r '.scripts.test // empty' package.json 2>/dev/null)
-    if [[ -n "$test_cmd" ]]; then
-      echo -n "  tests... "
-      if npm test --if-present 2>&1 | tail -5; then
-        echo "  tests passed"
-      else
-        warn "  tests FAILED"
-        failed=true
-      fi
-    fi
-  fi
+  # Push
+  git push origin "${BRANCH}" 2>&1 || true
 
-  if [[ "$failed" == true ]]; then
-    return 1
-  fi
-  return 0
-}
+  # Show summary
+  echo ""
+  info "=== Summary ==="
+  local ralph_commits
+  ralph_commits=$(git log --grep='RALPH:' --oneline --format='  %h %s' -20 2>/dev/null || echo "  No RALPH commits")
+  echo "$ralph_commits"
 
-# --- Iteration Loop ---
+  # Create PR
+  create_pr
 
-run_loop() {
-  local loop_start_time=$SECONDS
-
-  for i in $(seq 1 "$ITERATIONS"); do
-    echo ""
-    echo "=== Iteration ${i}/${ITERATIONS} === $(date '+%H:%M:%S') ==="
-    echo ""
-
-    local issues commits
-
-    issues=$(fetch_issues_summary)
-    commits=$(fetch_ralph_commits)
-
-    local issue_count
-    issue_count=$(echo "$issues" | jq 'if type == "array" then length else 1 end' 2>/dev/null || echo "0")
-
-    if [[ "$issue_count" -eq 0 ]]; then
-      success "No open issues remaining. Done."
-      break
-    fi
-
-    # Show issue titles
-    info "Issues available: ${issue_count}"
-    echo "$issues" | jq -r 'if type == "array" then .[:5][] | "  #\(.number) \(.title)" else "  #\(.number) \(.title)" end' 2>/dev/null || true
-    if [[ "$issue_count" -gt 5 ]]; then
-      echo "  ... and $((issue_count - 5)) more"
-    fi
-    echo ""
-
-    if [[ "$DRY_RUN" == true ]]; then
-      info "[DRY RUN] ${issue_count} issues available"
-      continue
-    fi
-
-    # Write lightweight issue list to working dir (Docker sandbox mounts it)
-    echo "$issues" > .sandcastle/issues.json
-    echo "$commits" > .sandcastle/ralph-commits.txt
-
-    local iter_start=$SECONDS
-
-    # Kill any previous heartbeat, start a new one
-    [[ -n "$HEARTBEAT_PID" ]] && kill "$HEARTBEAT_PID" 2>/dev/null || true
-    (
-      while true; do
-        sleep 60
-        local elapsed=$(( SECONDS - iter_start ))
-        local mins=$(( elapsed / 60 ))
-        echo -e "\033[0;34m  [heartbeat] ${mins}m elapsed — agent still running...\033[0m"
-      done
-    ) &
-    HEARTBEAT_PID=$!
-
-    info "Running agent... (${TIMEOUT_MINS}m timeout, ${MAX_TURNS} max turns)"
-
-    # Run Claude in Docker Sandbox — stream output in real-time via tee
-    local output_file="/tmp/sandcastle-output-${i}.txt"
-    > "$output_file"
-
-    timeout "${TIMEOUT_MINS}m" docker sandbox run claude \
-      --dangerously-skip-permissions \
-      --model sonnet \
-      --max-turns "${MAX_TURNS}" \
-      -p "@.sandcastle/prompt.md @.sandcastle/issues.json @.sandcastle/ralph-commits.txt \
-ONLY WORK ON A SINGLE TASK. \
-Use 'gh issue view #N' to read the full details of the issue you pick. \
-If all tasks are complete, output <promise>COMPLETE</promise>." \
-      2>&1 | tee "$output_file" || true
-
-    local exit_code=${PIPESTATUS[0]}
-
-    # Stop heartbeat
-    kill "$HEARTBEAT_PID" 2>/dev/null || true
-    wait "$HEARTBEAT_PID" 2>/dev/null || true
-    HEARTBEAT_PID=""
-
-    if [[ "$exit_code" -eq 124 ]]; then
-      warn "Iteration timed out after ${TIMEOUT_MINS}m — moving on"
-    fi
-
-    # Clean up temp files
-    rm -f .sandcastle/issues.json .sandcastle/ralph-commits.txt
-
-    # Show iteration summary
-    local iter_elapsed=$(( SECONDS - iter_start ))
-    local iter_mins=$(( iter_elapsed / 60 ))
-    local iter_secs=$(( iter_elapsed % 60 ))
-    echo ""
-    info "Iteration ${i} completed in ${iter_mins}m ${iter_secs}s"
-
-    # Show what changed
-    local changed_files
-    changed_files=$(git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
-    local new_commits
-    new_commits=$(git log --oneline -3 --since="$(( iter_elapsed + 10 )) seconds ago" 2>/dev/null || true)
-
-    if [[ -n "$changed_files" ]]; then
-      local file_count
-      file_count=$(echo "$changed_files" | wc -l | tr -d '[:space:]')
-      info "Files changed: ${file_count}"
-      echo "$changed_files" | head -5 | sed 's/^/  /'
-      if [[ "$file_count" -gt 5 ]]; then
-        echo "  ... and $((file_count - 5)) more"
-      fi
-    fi
-
-    if [[ -n "$new_commits" ]]; then
-      info "Recent commits:"
-      echo "$new_commits" | sed 's/^/  /'
-    fi
-
-    # Check for COMPLETE signal
-    if grep -q '<promise>COMPLETE</promise>' "$output_file" 2>/dev/null; then
-      rm -f "$output_file"
-      success "All tasks complete!"
-      break
-    fi
-    rm -f "$output_file"
-
-    # Safety net: auto-commit any uncommitted work
-    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-      # Run quality gate before committing
-      if run_quality_gate; then
-        info "Quality gate passed — committing"
-        git add -A
-        git commit -m "RALPH: auto-commit work from iteration ${i}"
-      else
-        warn "Quality gate failed — reverting uncommitted changes"
-        git checkout -- . 2>/dev/null || true
-        git clean -fd 2>/dev/null || true
-      fi
-    fi
-
-    # Push after each iteration
-    git push origin "${BRANCH}" 2>&1 || true
-
-    # Show total elapsed
-    local total_elapsed=$(( SECONDS - loop_start_time ))
-    local total_mins=$(( total_elapsed / 60 ))
-    echo ""
-    info "Total elapsed: ${total_mins}m | Next: iteration $((i + 1))/${ITERATIONS}"
-
-  done
+  # Notify
+  local milestone_label="${MILESTONE_FILTER:-all issues}"
+  notify "$milestone_label" "Ralph finished processing ${milestone_label}"
 }
 
 # --- PR Creation ---
@@ -390,10 +282,8 @@ create_pr() {
     pr_title="[Ralph] All issues — $(date +%Y-%m-%d)"
   fi
 
-  # Push final state
   git push origin "${BRANCH}" 2>&1 || die "Failed to push branch"
 
-  # Check for existing PR
   local existing_pr
   existing_pr=$(gh pr list --head "${BRANCH}" --json url -q '.[0].url' 2>/dev/null || true)
 
@@ -485,25 +375,17 @@ main() {
 
   echo "Repo:       ${OWNER}/${REPO}"
   echo "Iterations: ${ITERATIONS}"
-  echo "Timeout:    ${TIMEOUT_MINS}m per iteration"
-  echo "Max turns:  ${MAX_TURNS} per iteration"
   echo ""
 
   pick_milestone
   setup_branch
-
+  prepare_context
   run_loop
 
   if [[ "$DRY_RUN" != true ]]; then
-    create_pr
-
-    local milestone_label="${MILESTONE_FILTER:-all issues}"
-    notify "$milestone_label" "Ralph finished processing ${milestone_label}"
+    post_loop
     echo ""
     success "=== SANDCASTLE COMPLETE ==="
-  else
-    echo ""
-    info "=== DRY RUN COMPLETE ==="
   fi
 }
 
