@@ -168,11 +168,27 @@ start_container() {
 
   info "Starting container: ${CONTAINER_NAME}..."
 
-  # Load .env and pass as env vars
-  docker run -d \
-    --name "$CONTAINER_NAME" \
-    --env-file "$SANDCASTLE_DIR/.env" \
-    "$IMAGE_NAME" \
+  # Determine Claude auth mode
+  local claude_auth
+  claude_auth=$(grep '^CLAUDE_AUTH=' "$SANDCASTLE_DIR/.env" | cut -d= -f2- || echo "subscription")
+
+  local docker_args=(
+    -d
+    --name "$CONTAINER_NAME"
+    --env-file "$SANDCASTLE_DIR/.env"
+  )
+
+  # Mount ~/.claude/ for subscription auth
+  if [[ "$claude_auth" != "api-key" ]]; then
+    if [[ -d "$HOME/.claude" ]]; then
+      docker_args+=(-v "$HOME/.claude:/home/agent/.claude:ro")
+      info "Mounting ~/.claude/ for subscription auth"
+    else
+      warn "~/.claude/ not found — Claude Code may not be authenticated"
+    fi
+  fi
+
+  docker run "${docker_args[@]}" "$IMAGE_NAME" \
     || die "Failed to start container"
 
   success "Container started: ${CONTAINER_NAME}"
