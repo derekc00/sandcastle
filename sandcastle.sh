@@ -241,10 +241,7 @@ setup_repo() {
     fi
   " || die "Failed to sync repo into container"
 
-  # Configure gh auth inside container
-  docker exec "$CONTAINER_NAME" bash -c "
-    echo '${GITHUB_TOKEN}' | gh auth login --with-token 2>/dev/null
-  " || warn "gh auth setup failed — Claude may not be able to close issues"
+  # gh auth is handled automatically via GITHUB_TOKEN env var in the container
 
   success "Repo synced and branch '${BRANCH}' created"
 }
