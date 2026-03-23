@@ -279,9 +279,11 @@ run_loop() {
 
     info "Running agent... (${TIMEOUT_MINS}m timeout, ${MAX_TURNS} max turns)"
 
-    # Run Claude in Docker Sandbox with timeout
-    local result
-    result=$(timeout "${TIMEOUT_MINS}m" docker sandbox run claude \
+    # Run Claude in Docker Sandbox — stream output in real-time via tee
+    local output_file="/tmp/sandcastle-output-${i}.txt"
+    > "$output_file"
+
+    timeout "${TIMEOUT_MINS}m" docker sandbox run claude \
       --dangerously-skip-permissions \
       --model sonnet \
       --max-turns "${MAX_TURNS}" \
@@ -289,8 +291,9 @@ run_loop() {
 ONLY WORK ON A SINGLE TASK. \
 Use 'gh issue view #N' to read the full details of the issue you pick. \
 If all tasks are complete, output <promise>COMPLETE</promise>." \
-      2>&1)
-    local exit_code=$?
+      2>&1 | tee "$output_file" || true
+
+    local exit_code=${PIPESTATUS[0]}
 
     # Stop heartbeat
     kill "$HEARTBEAT_PID" 2>/dev/null || true
@@ -299,12 +302,6 @@ If all tasks are complete, output <promise>COMPLETE</promise>." \
 
     if [[ "$exit_code" -eq 124 ]]; then
       warn "Iteration timed out after ${TIMEOUT_MINS}m — moving on"
-    fi
-    wait "$heartbeat_pid" 2>/dev/null || true
-
-    # Show Claude's output (last 50 lines to avoid flooding)
-    if [[ -n "$result" ]]; then
-      echo "$result" | tail -50
     fi
 
     # Clean up temp files
@@ -339,10 +336,12 @@ If all tasks are complete, output <promise>COMPLETE</promise>." \
     fi
 
     # Check for COMPLETE signal
-    if [[ "$result" == *"<promise>COMPLETE</promise>"* ]]; then
+    if grep -q '<promise>COMPLETE</promise>' "$output_file" 2>/dev/null; then
+      rm -f "$output_file"
       success "All tasks complete!"
       break
     fi
+    rm -f "$output_file"
 
     # Safety net: auto-commit any uncommitted work
     if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
