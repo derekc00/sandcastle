@@ -16,7 +16,6 @@ REPO=""
 OWNER=""
 BRANCH=""
 ITERATIONS=100
-TIMEOUT_MINS=20
 MAX_TURNS=75
 MILESTONE=""
 MILESTONE_FILTER=""
@@ -52,7 +51,6 @@ preflight() {
   # Read config
   if [[ -f "$SANDCASTLE_DIR/config.json" ]]; then
     ITERATIONS=$(jq -r '.defaultIterations // 100' "$SANDCASTLE_DIR/config.json")
-    TIMEOUT_MINS=$(jq -r '.timeoutMinutes // 20' "$SANDCASTLE_DIR/config.json")
     MAX_TURNS=$(jq -r '.maxTurns // 75' "$SANDCASTLE_DIR/config.json")
   fi
 }
@@ -261,16 +259,11 @@ run_loop() {
     ) &
     local heartbeat_pid=$!
 
-    info "Running agent... (${TIMEOUT_MINS}m timeout, ${MAX_TURNS} max turns)"
+    info "Running agent... (${MAX_TURNS} max turns)"
 
     # Run Claude in Docker Sandbox
-    # Key fixes:
-    #   1. --dangerously-skip-permissions: Docker sandbox IS the security boundary.
-    #      acceptEdits blocks Bash commands (git, npm, test) causing hangs in -p mode.
-    #   2. --max-turns: Prevents infinite fix loops (test fail → fix → test fail → ...)
-    #   3. Lightweight issue list: Only titles, Claude reads full body via gh issue view.
     local result
-    result=$(timeout "${TIMEOUT_MINS}m" docker sandbox run claude \
+    result=$(docker sandbox run claude \
       --dangerously-skip-permissions \
       --model sonnet \
       --max-turns "${MAX_TURNS}" \
@@ -280,15 +273,9 @@ Use 'gh issue view #N' to read the full details of the issue you pick. \
 If all tasks are complete, output <promise>COMPLETE</promise>." \
       2>&1) || true
 
-    local exit_code=$?
-
     # Stop heartbeat
     kill "$heartbeat_pid" 2>/dev/null || true
     wait "$heartbeat_pid" 2>/dev/null || true
-
-    if [[ "$exit_code" -eq 124 ]]; then
-      warn "Iteration timed out after ${TIMEOUT_MINS}m"
-    fi
 
     # Show Claude's output (last 50 lines to avoid flooding)
     if [[ -n "$result" ]]; then
@@ -474,7 +461,6 @@ main() {
 
   echo "Repo:       ${OWNER}/${REPO}"
   echo "Iterations: ${ITERATIONS}"
-  echo "Timeout:    ${TIMEOUT_MINS}m per iteration"
   echo "Max turns:  ${MAX_TURNS} per iteration"
   echo ""
 
