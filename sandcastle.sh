@@ -197,6 +197,9 @@ start_container() {
     docker_args+=(--env-file "$SANDCASTLE_DIR/.env")
   fi
 
+  # Give container enough memory for Claude Code
+  docker_args+=(--memory=4g)
+
   # Mount ~/.claude/ for settings/skills (read-only)
   if [[ -d "$HOME/.claude" ]]; then
     docker_args+=(-v "$HOME/.claude:/home/agent/.claude:ro")
@@ -228,8 +231,13 @@ setup_repo() {
     git config user.name 'Ralph (Sandcastle)'
     git config user.email 'ralph@sandcastle.dev'
 
-    # Create and checkout ralph branch
-    git checkout -B '${BRANCH}' 2>/dev/null
+    # Checkout ralph branch — track remote if it exists, otherwise create
+    if git ls-remote --heads origin '${BRANCH}' | grep -q '${BRANCH}'; then
+      git checkout '${BRANCH}' 2>/dev/null || git checkout -b '${BRANCH}' 'origin/${BRANCH}'
+      git pull origin '${BRANCH}' --rebase 2>/dev/null || true
+    else
+      git checkout -b '${BRANCH}' 2>/dev/null || git checkout '${BRANCH}'
+    fi
 
     # Install dependencies
     if [ -f pnpm-lock.yaml ]; then
@@ -249,7 +257,7 @@ setup_repo() {
 # --- Issue Fetching ---
 
 fetch_issues() {
-  local issue_args="--state open --json number,title,body,labels,comments --limit 100"
+  local issue_args="--state open --json number,title,body,labels --limit 30"
 
   if [[ -n "$MILESTONE_FILTER" ]]; then
     issue_args="$issue_args --milestone \"${MILESTONE_FILTER}\""
@@ -349,6 +357,7 @@ ${prompt_content}"
         git add -A
         git commit -m 'RALPH: auto-commit uncommitted work from iteration ${i}'
       fi
+      git pull origin '${BRANCH}' --rebase 2>&1 || true
       git push origin '${BRANCH}' 2>&1 || true
     " || true
 
