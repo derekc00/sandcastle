@@ -49,9 +49,6 @@ preflight() {
     || die "No prompt.md in .sandcastle/."
   [[ -f "$SANDCASTLE_DIR/config.json" ]] \
     || die "No config.json in .sandcastle/."
-  [[ -f "$SANDCASTLE_DIR/.env" ]] \
-    || die "No .env file in .sandcastle/. Copy .env.example and fill in your tokens."
-
   # Check Docker is running
   docker info &>/dev/null \
     || die "Docker is not running. Start Docker Desktop and try again."
@@ -60,9 +57,11 @@ preflight() {
   gh auth status &>/dev/null \
     || die "GitHub CLI not authenticated. Run 'gh auth login'."
 
-  # Get repo info
+  # Get repo info and token from host environment
   REPO=$(gh repo view --json name -q '.name')
   OWNER=$(gh repo view --json owner -q '.owner.login')
+  GITHUB_TOKEN=$(gh auth token)
+  GITHUB_REPO="${OWNER}/${REPO}"
   IMAGE_NAME="sandcastle-${REPO}"
   CONTAINER_NAME="sandcastle-${REPO}"
 
@@ -168,24 +167,22 @@ start_container() {
 
   info "Starting container: ${CONTAINER_NAME}..."
 
-  # Determine Claude auth mode
-  local claude_auth
-  claude_auth=$(grep '^CLAUDE_AUTH=' "$SANDCASTLE_DIR/.env" | cut -d= -f2- || echo "subscription")
-
   local docker_args=(
     -d
     --name "$CONTAINER_NAME"
-    --env-file "$SANDCASTLE_DIR/.env"
+    -e "GITHUB_TOKEN=${GITHUB_TOKEN}"
+    -e "GITHUB_REPO=${GITHUB_REPO}"
   )
 
+  # Pass project-specific env vars from .env if it exists
+  if [[ -f "$SANDCASTLE_DIR/.env" ]]; then
+    docker_args+=(--env-file "$SANDCASTLE_DIR/.env")
+  fi
+
   # Mount ~/.claude/ for subscription auth
-  if [[ "$claude_auth" != "api-key" ]]; then
-    if [[ -d "$HOME/.claude" ]]; then
-      docker_args+=(-v "$HOME/.claude:/home/agent/.claude:ro")
-      info "Mounting ~/.claude/ for subscription auth"
-    else
-      warn "~/.claude/ not found — Claude Code may not be authenticated"
-    fi
+  if [[ -d "$HOME/.claude" ]]; then
+    docker_args+=(-v "$HOME/.claude:/home/agent/.claude:ro")
+    info "Mounting ~/.claude/ for subscription auth"
   fi
 
   docker run "${docker_args[@]}" "$IMAGE_NAME" \
@@ -197,15 +194,7 @@ start_container() {
 setup_repo() {
   info "Syncing repo into sandbox..."
 
-  # Source the .env to get GITHUB_TOKEN and GITHUB_REPO
-  local github_token github_repo
-  github_token=$(grep '^GITHUB_TOKEN=' "$SANDCASTLE_DIR/.env" | cut -d= -f2-)
-  github_repo=$(grep '^GITHUB_REPO=' "$SANDCASTLE_DIR/.env" | cut -d= -f2-)
-
-  [[ -n "$github_token" ]] || die "GITHUB_TOKEN not found in .env"
-  [[ -n "$github_repo" ]] || die "GITHUB_REPO not found in .env"
-
-  # Clone repo inside container
+  # Clone repo inside container using token from host gh auth
   docker exec "$CONTAINER_NAME" bash -c "
     cd /home/agent/repos
     if [ -d '${REPO}' ]; then
@@ -214,7 +203,7 @@ setup_repo() {
       git checkout main 2>/dev/null || git checkout master
       git pull
     else
-      git clone 'https://x-access-token:${github_token}@github.com/${github_repo}.git' '${REPO}'
+      git clone 'https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git' '${REPO}'
       cd '${REPO}'
     fi
 
@@ -237,7 +226,7 @@ setup_repo() {
 
   # Configure gh auth inside container
   docker exec "$CONTAINER_NAME" bash -c "
-    echo '${github_token}' | gh auth login --with-token 2>/dev/null
+    echo '${GITHUB_TOKEN}' | gh auth login --with-token 2>/dev/null
   " || warn "gh auth setup failed — Claude may not be able to close issues"
 
   success "Repo synced and branch '${BRANCH}' created"
