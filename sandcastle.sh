@@ -242,10 +242,17 @@ ${prompt_content}"
         # Save raw output
         echo "$line" >> "$output_file"
 
+        # Try to parse as JSON
+        if ! echo "$line" | jq -e '.' &>/dev/null; then
+          # Not JSON — show as plain text (docker messages, errors, etc.)
+          [[ -n "$line" ]] && echo "  $line"
+          continue
+        fi
+
         # Parse JSON events into live status
         local msg_type tool_name file_path cmd_text result_text
 
-        msg_type=$(echo "$line" | jq -r 'type as $t | if $t == "object" then (.type // empty) else empty end' 2>/dev/null) || continue
+        msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
 
         case "$msg_type" in
           tool_use)
@@ -272,14 +279,28 @@ ${prompt_content}"
                 pattern=$(echo "$line" | jq -r '.input.pattern // empty' 2>/dev/null)
                 [[ -n "$pattern" ]] && echo -e "  \033[0;34m[search]\033[0m   ${pattern}" || echo -e "  \033[0;34m[search]\033[0m"
                 ;;
-              TaskCreate|TaskUpdate)
-                echo -e "  \033[0;36m[task]\033[0m"
+              *)
+                [[ -n "$tool_name" ]] && echo -e "  \033[0;36m[${tool_name}]\033[0m"
                 ;;
             esac
             ;;
           result)
             result_text=$(echo "$line" | jq -r '.result // empty' 2>/dev/null)
             [[ -n "$result_text" ]] && echo "$result_text" > "$result_file"
+            ;;
+          system)
+            local subtype
+            subtype=$(echo "$line" | jq -r '.subtype // empty' 2>/dev/null)
+            [[ -n "$subtype" ]] && echo -e "  \033[0;34m[system]\033[0m  ${subtype}"
+            ;;
+          error)
+            local error_msg
+            error_msg=$(echo "$line" | jq -r '.error // .message // empty' 2>/dev/null)
+            [[ -n "$error_msg" ]] && echo -e "  \033[0;31m[error]\033[0m   ${error_msg}"
+            ;;
+          *)
+            # Show unknown types so nothing is silently swallowed
+            [[ -n "$msg_type" ]] && echo -e "  \033[0;90m[${msg_type}]\033[0m"
             ;;
         esac
       done || true
