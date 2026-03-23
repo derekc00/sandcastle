@@ -16,6 +16,8 @@ REPO=""
 OWNER=""
 BRANCH=""
 ITERATIONS=100
+TIMEOUT_MINS=20
+MAX_TURNS=75
 MILESTONE=""
 MILESTONE_FILTER=""
 RUN_ALL=false
@@ -47,8 +49,11 @@ preflight() {
   REPO=$(gh repo view --json name -q '.name')
   OWNER=$(gh repo view --json owner -q '.owner.login')
 
+  # Read config
   if [[ -f "$SANDCASTLE_DIR/config.json" ]]; then
     ITERATIONS=$(jq -r '.defaultIterations // 100' "$SANDCASTLE_DIR/config.json")
+    TIMEOUT_MINS=$(jq -r '.timeoutMinutes // 20' "$SANDCASTLE_DIR/config.json")
+    MAX_TURNS=$(jq -r '.maxTurns // 75' "$SANDCASTLE_DIR/config.json")
   fi
 }
 
@@ -141,8 +146,10 @@ setup_branch() {
 
 # --- Issue Fetching ---
 
-fetch_issues() {
-  local issue_args="--state open --json number,title,body,labels --limit 30"
+fetch_issues_summary() {
+  # Only fetch number + title (lightweight) for the issue list
+  # Claude will use `gh issue view #N` to read the full body of whichever it picks
+  local issue_args="--state open --json number,title,labels --limit 10"
 
   if [[ -n "$MILESTONE_FILTER" ]]; then
     issue_args="$issue_args --milestone \"${MILESTONE_FILTER}\""
@@ -160,11 +167,50 @@ fetch_ralph_commits() {
   git log --grep='RALPH:' --oneline -10 --format='%h %ad %s' --date=short 2>/dev/null || echo "No RALPH commits yet"
 }
 
+# --- Quality Gate ---
+
+run_quality_gate() {
+  info "Running quality gate..."
+
+  local failed=false
+
+  # Detect and run typecheck
+  if [[ -f "tsconfig.json" ]]; then
+    if command -v npx &>/dev/null; then
+      echo -n "  typecheck... "
+      if npx tsc --noEmit 2>&1 | tail -3; then
+        echo "  typecheck passed"
+      else
+        warn "  typecheck FAILED"
+        failed=true
+      fi
+    fi
+  fi
+
+  # Detect and run tests (quick check, not full suite)
+  if [[ -f "package.json" ]]; then
+    local test_cmd
+    test_cmd=$(jq -r '.scripts.test // empty' package.json 2>/dev/null)
+    if [[ -n "$test_cmd" ]]; then
+      echo -n "  tests... "
+      if npm test --if-present 2>&1 | tail -5; then
+        echo "  tests passed"
+      else
+        warn "  tests FAILED"
+        failed=true
+      fi
+    fi
+  fi
+
+  if [[ "$failed" == true ]]; then
+    return 1
+  fi
+  return 0
+}
+
 # --- Iteration Loop ---
 
 run_loop() {
-  local prompt_content
-  prompt_content=$(cat "$SANDCASTLE_DIR/prompt.md")
   local loop_start_time=$SECONDS
 
   for i in $(seq 1 "$ITERATIONS"); do
@@ -172,9 +218,9 @@ run_loop() {
     echo "=== Iteration ${i}/${ITERATIONS} === $(date '+%H:%M:%S') ==="
     echo ""
 
-    local issues commits full_prompt
+    local issues commits
 
-    issues=$(fetch_issues)
+    issues=$(fetch_issues_summary)
     commits=$(fetch_ralph_commits)
 
     local issue_count
@@ -185,9 +231,9 @@ run_loop() {
       break
     fi
 
-    # Show issue titles for visibility
+    # Show issue titles
     info "Issues available: ${issue_count}"
-    echo "$issues" | jq -r 'if type == "array" then .[:5][] | "  #\(.number) \(.title)"  else "#\(.number) \(.title)" end' 2>/dev/null || true
+    echo "$issues" | jq -r 'if type == "array" then .[:5][] | "  #\(.number) \(.title)" else "  #\(.number) \(.title)" end' 2>/dev/null || true
     if [[ "$issue_count" -gt 5 ]]; then
       echo "  ... and $((issue_count - 5)) more"
     fi
@@ -198,13 +244,13 @@ run_loop() {
       continue
     fi
 
-    # Write issues + commits to files in the working dir (Docker sandbox mounts it)
+    # Write lightweight issue list to working dir (Docker sandbox mounts it)
     echo "$issues" > .sandcastle/issues.json
     echo "$commits" > .sandcastle/ralph-commits.txt
 
     local iter_start=$SECONDS
 
-    # Start heartbeat in background
+    # Start heartbeat
     (
       while true; do
         sleep 60
@@ -215,33 +261,39 @@ run_loop() {
     ) &
     local heartbeat_pid=$!
 
-    # Read timeout from config (default 20 minutes)
-    local timeout_mins
-    timeout_mins=$(jq -r '.timeoutMinutes // 20' "$SANDCASTLE_DIR/config.json" 2>/dev/null || echo 20)
+    info "Running agent... (${TIMEOUT_MINS}m timeout, ${MAX_TURNS} max turns)"
 
-    info "Running agent... (${timeout_mins}m timeout)"
-
-    # Run Claude in Docker Sandbox with timeout
+    # Run Claude in Docker Sandbox
+    # Key fixes:
+    #   1. --dangerously-skip-permissions: Docker sandbox IS the security boundary.
+    #      acceptEdits blocks Bash commands (git, npm, test) causing hangs in -p mode.
+    #   2. --max-turns: Prevents infinite fix loops (test fail → fix → test fail → ...)
+    #   3. Lightweight issue list: Only titles, Claude reads full body via gh issue view.
     local result
-    result=$(timeout "${timeout_mins}m" docker sandbox run claude \
-      --permission-mode acceptEdits \
+    result=$(timeout "${TIMEOUT_MINS}m" docker sandbox run claude \
+      --dangerously-skip-permissions \
       --model sonnet \
+      --max-turns "${MAX_TURNS}" \
       -p "@.sandcastle/prompt.md @.sandcastle/issues.json @.sandcastle/ralph-commits.txt \
 ONLY WORK ON A SINGLE TASK. \
+Use 'gh issue view #N' to read the full details of the issue you pick. \
 If all tasks are complete, output <promise>COMPLETE</promise>." \
       2>&1) || true
 
     local exit_code=$?
-    if [[ "$exit_code" -eq 124 ]]; then
-      warn "Iteration timed out after ${timeout_mins}m — moving to next iteration"
-    fi
 
     # Stop heartbeat
     kill "$heartbeat_pid" 2>/dev/null || true
     wait "$heartbeat_pid" 2>/dev/null || true
 
-    # Show Claude's output
-    echo "$result"
+    if [[ "$exit_code" -eq 124 ]]; then
+      warn "Iteration timed out after ${TIMEOUT_MINS}m"
+    fi
+
+    # Show Claude's output (last 50 lines to avoid flooding)
+    if [[ -n "$result" ]]; then
+      echo "$result" | tail -50
+    fi
 
     # Clean up temp files
     rm -f .sandcastle/issues.json .sandcastle/ralph-commits.txt
@@ -282,9 +334,16 @@ If all tasks are complete, output <promise>COMPLETE</promise>." \
 
     # Safety net: auto-commit any uncommitted work
     if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-      warn "Auto-committing uncommitted changes..."
-      git add -A
-      git commit -m "RALPH: auto-commit uncommitted work from iteration ${i}"
+      # Run quality gate before committing
+      if run_quality_gate; then
+        info "Quality gate passed — committing"
+        git add -A
+        git commit -m "RALPH: auto-commit work from iteration ${i}"
+      else
+        warn "Quality gate failed — reverting uncommitted changes"
+        git checkout -- . 2>/dev/null || true
+        git clean -fd 2>/dev/null || true
+      fi
     fi
 
     # Push after each iteration
@@ -415,6 +474,8 @@ main() {
 
   echo "Repo:       ${OWNER}/${REPO}"
   echo "Iterations: ${ITERATIONS}"
+  echo "Timeout:    ${TIMEOUT_MINS}m per iteration"
+  echo "Max turns:  ${MAX_TURNS} per iteration"
   echo ""
 
   pick_milestone
