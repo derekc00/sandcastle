@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # sandcastle — autonomous AI development loop
-# Runs Claude Code inside Docker to implement GitHub issues
+# Uses Docker Sandbox + Claude Code to implement GitHub issues
 
 # Colors
 RED='\033[0;31m'
@@ -12,8 +12,6 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 SANDCASTLE_DIR=".sandcastle"
-CONTAINER_NAME=""
-IMAGE_NAME=""
 REPO=""
 OWNER=""
 BRANCH=""
@@ -34,39 +32,24 @@ warn() { echo -e "${YELLOW}$1${NC}"; }
 # --- Preflight Checks ---
 
 preflight() {
-  # Check we're in a git repo
   git rev-parse --is-inside-work-tree &>/dev/null \
-    || die "Not in a git repo. Run this from a project directory."
+    || die "Not in a git repo."
 
-  # Check .sandcastle/ exists
-  [[ -d "$SANDCASTLE_DIR" ]] \
-    || die "No .sandcastle/ directory found. Create one with Dockerfile, config.json, and prompt.md."
-
-  # Check required files
-  [[ -f "$SANDCASTLE_DIR/Dockerfile" ]] \
-    || die "No Dockerfile in .sandcastle/."
   [[ -f "$SANDCASTLE_DIR/prompt.md" ]] \
-    || die "No prompt.md in .sandcastle/."
-  [[ -f "$SANDCASTLE_DIR/config.json" ]] \
-    || die "No config.json in .sandcastle/."
-  # Check Docker is running
-  docker info &>/dev/null \
-    || die "Docker is not running. Start Docker Desktop and try again."
+    || die "No prompt.md in .sandcastle/. Run /ralph to scaffold."
 
-  # Check gh auth
+  docker info &>/dev/null \
+    || die "Docker is not running. Start Docker Desktop 4.50+."
+
   gh auth status &>/dev/null \
     || die "GitHub CLI not authenticated. Run 'gh auth login'."
 
-  # Get repo info and token from host environment
   REPO=$(gh repo view --json name -q '.name')
   OWNER=$(gh repo view --json owner -q '.owner.login')
-  GITHUB_TOKEN=$(gh auth token)
-  GITHUB_REPO="${OWNER}/${REPO}"
-  IMAGE_NAME="sandcastle-$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')"
-  CONTAINER_NAME="sandcastle-$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')"
 
-  # Read iterations from config
-  ITERATIONS=$(jq -r '.defaultIterations // 100' "$SANDCASTLE_DIR/config.json")
+  if [[ -f "$SANDCASTLE_DIR/config.json" ]]; then
+    ITERATIONS=$(jq -r '.defaultIterations // 100' "$SANDCASTLE_DIR/config.json")
+  fi
 }
 
 # --- Milestone Picker ---
@@ -86,7 +69,6 @@ pick_milestone() {
     return
   fi
 
-  # Fetch open milestones
   local milestones
   milestones=$(gh api "repos/${OWNER}/${REPO}/milestones?state=open&per_page=100" 2>/dev/null)
 
@@ -120,7 +102,6 @@ pick_milestone() {
     return
   fi
 
-  # Validate numeric input
   if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt "$count" ]]; then
     die "Invalid selection: $choice"
   fi
@@ -136,128 +117,25 @@ pick_milestone() {
   fi
 
   MILESTONE_FILTER="$MILESTONE"
-  # Slugify milestone name for branch
   BRANCH="ralph/$(echo "$MILESTONE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')"
 
   info "Selected milestone: ${MILESTONE} (${open_count} open issues)"
 }
 
-# --- Container Management ---
+# --- Git Setup ---
 
-build_image() {
-  if docker image inspect "$IMAGE_NAME" &>/dev/null; then
-    info "Image ${IMAGE_NAME} already exists, skipping build"
-    return
-  fi
+setup_branch() {
+  info "Setting up branch: ${BRANCH}"
 
-  info "Building Docker image: ${IMAGE_NAME}..."
-  docker build -t "$IMAGE_NAME" -f "$SANDCASTLE_DIR/Dockerfile" . \
-    || die "Docker build failed"
-  success "Image built: ${IMAGE_NAME}"
-}
-
-start_container() {
-  if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-    info "Container ${CONTAINER_NAME} already running"
-    return
-  fi
-
-  # Remove stopped container if exists
-  docker rm -f "$CONTAINER_NAME" &>/dev/null || true
-
-  info "Starting container: ${CONTAINER_NAME}..."
-
-  # Extract Claude Code OAuth token from macOS Keychain
-  local claude_token=""
-  if command -v security &>/dev/null; then
-    local creds_json
-    creds_json=$(security find-generic-password -s "Claude Code-credentials" -a "$(whoami)" -w 2>/dev/null || true)
-    if [[ -n "$creds_json" ]]; then
-      claude_token=$(echo "$creds_json" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)
-    fi
-  fi
-
-  local docker_args=(
-    -d
-    --name "$CONTAINER_NAME"
-    -e "GITHUB_TOKEN=${GITHUB_TOKEN}"
-    -e "GITHUB_REPO=${GITHUB_REPO}"
-  )
-
-  # Pass Claude OAuth token (same env var Matt Pocock uses)
-  if [[ -n "$claude_token" ]]; then
-    docker_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${claude_token}")
-    info "Using Claude subscription token from keychain"
+  # Create or checkout the ralph branch
+  if git ls-remote --heads origin "${BRANCH}" 2>/dev/null | grep -q "${BRANCH}"; then
+    git checkout "${BRANCH}" 2>/dev/null || git checkout -b "${BRANCH}" "origin/${BRANCH}"
+    git pull origin "${BRANCH}" --rebase 2>/dev/null || true
   else
-    warn "Could not extract Claude token from keychain — Claude may not be authenticated"
+    git checkout -b "${BRANCH}" 2>/dev/null || git checkout "${BRANCH}"
   fi
 
-  # Pass project-specific env vars from .env if it exists
-  if [[ -f "$SANDCASTLE_DIR/.env" ]]; then
-    docker_args+=(--env-file "$SANDCASTLE_DIR/.env")
-  fi
-
-  # Give container enough memory for Claude Code
-  docker_args+=(--memory=12g)
-
-  # Mount ~/.claude/ for settings/skills (read-only)
-  if [[ -d "$HOME/.claude" ]]; then
-    docker_args+=(-v "$HOME/.claude:/home/agent/.claude:ro")
-  fi
-
-  docker run "${docker_args[@]}" "$IMAGE_NAME" \
-    || die "Failed to start container"
-
-  # Copy .claude.json into container (Claude Code needs it writable)
-  if [[ -f "$HOME/.claude.json" ]]; then
-    docker cp "$HOME/.claude.json" "${CONTAINER_NAME}:/home/agent/.claude.json"
-    docker exec "$CONTAINER_NAME" bash -c "chown agent:agent /home/agent/.claude.json 2>/dev/null || true"
-  fi
-
-  success "Container started: ${CONTAINER_NAME}"
-}
-
-setup_repo() {
-  info "Syncing repo into sandbox..."
-
-  # Clone repo inside container using token from host gh auth
-  docker exec "$CONTAINER_NAME" bash -c "
-    cd /home/agent/repos
-    if [ -d '${REPO}' ]; then
-      cd '${REPO}'
-      git fetch origin
-      git checkout main 2>/dev/null || git checkout master
-      git pull
-    else
-      git clone 'https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git' '${REPO}'
-      cd '${REPO}'
-    fi
-
-    # Configure git
-    git config user.name 'Ralph (Sandcastle)'
-    git config user.email 'ralph@sandcastle.dev'
-
-    # Checkout ralph branch — track remote if it exists, otherwise create
-    if git ls-remote --heads origin '${BRANCH}' | grep -q '${BRANCH}'; then
-      git checkout '${BRANCH}' 2>/dev/null || git checkout -b '${BRANCH}' 'origin/${BRANCH}'
-      git pull origin '${BRANCH}' --rebase 2>/dev/null || true
-    else
-      git checkout -b '${BRANCH}' 2>/dev/null || git checkout '${BRANCH}'
-    fi
-
-    # Install dependencies
-    if [ -f pnpm-lock.yaml ]; then
-      pnpm install --frozen-lockfile 2>/dev/null || pnpm install
-    elif [ -f package-lock.json ]; then
-      npm ci 2>/dev/null || npm install
-    elif [ -f yarn.lock ]; then
-      yarn install --frozen-lockfile 2>/dev/null || yarn install
-    fi
-  " || die "Failed to sync repo into container"
-
-  # gh auth is handled automatically via GITHUB_TOKEN env var in the container
-
-  success "Repo synced and branch '${BRANCH}' created"
+  success "On branch ${BRANCH}"
 }
 
 # --- Issue Fetching ---
@@ -270,25 +148,15 @@ fetch_issues() {
   fi
 
   if [[ -n "$SINGLE_ISSUE" ]]; then
-    # Fetch single issue
-    docker exec "$CONTAINER_NAME" bash -c "
-      cd /home/agent/repos/${REPO}
-      gh issue view ${SINGLE_ISSUE} --json number,title,body,labels,comments
-    " 2>/dev/null
+    gh issue view "${SINGLE_ISSUE}" --json number,title,body,labels 2>/dev/null
     return
   fi
 
-  docker exec "$CONTAINER_NAME" bash -c "
-    cd /home/agent/repos/${REPO}
-    gh issue list ${issue_args}
-  " 2>/dev/null
+  eval "gh issue list ${issue_args}" 2>/dev/null
 }
 
 fetch_ralph_commits() {
-  docker exec "$CONTAINER_NAME" bash -c "
-    cd /home/agent/repos/${REPO}
-    git log --grep='RALPH:' --oneline -10 --format='%h %ad %s' --date=short 2>/dev/null || echo '[]'
-  " 2>/dev/null
+  git log --grep='RALPH:' --oneline -10 --format='%h %ad %s' --date=short 2>/dev/null || echo "No RALPH commits yet"
 }
 
 # --- Iteration Loop ---
@@ -302,14 +170,12 @@ run_loop() {
     echo "=== Iteration ${i}/${ITERATIONS} ==="
     echo ""
 
-    # Fetch fresh issues and commits
     info "Running agent..."
-    local issues commits full_prompt output
+    local issues commits full_prompt
 
     issues=$(fetch_issues)
     commits=$(fetch_ralph_commits)
 
-    # Check if any issues remain
     local issue_count
     issue_count=$(echo "$issues" | jq 'if type == "array" then length else 1 end' 2>/dev/null || echo "0")
 
@@ -328,24 +194,24 @@ ${commits}
 ${prompt_content}"
 
     if [[ "$DRY_RUN" == true ]]; then
-      info "[DRY RUN] Would invoke claude -p with ${#full_prompt} char prompt"
-      info "[DRY RUN] Issues: ${issue_count}"
+      info "[DRY RUN] Would invoke claude -p with ${#full_prompt} char prompt (${issue_count} issues)"
       continue
     fi
 
-    # Write prompt to file inside container (avoids bash escaping issues with large prompts)
-    echo "$full_prompt" | docker exec -i "$CONTAINER_NAME" bash -c "cat > /tmp/sandcastle-prompt.md"
+    # Write prompt to temp file (avoids bash escaping issues with large JSON)
+    local prompt_file
+    prompt_file=$(mktemp /tmp/sandcastle-prompt-XXXXXX.md)
+    echo "$full_prompt" > "$prompt_file"
 
-    # Run Claude inside container — stream output directly
+    # Run Claude in Docker Sandbox — handles auth, mounts, and isolation automatically
     local output_file="/tmp/sandcastle-output-${i}.txt"
-    docker exec "$CONTAINER_NAME" bash -c "
-      cd /home/agent/repos/${REPO}
-      claude -p \"\$(cat /tmp/sandcastle-prompt.md)\" \
-        --dangerously-skip-permissions \
-        --model sonnet \
-        --output-format text \
-        2>&1 || true
-    " 2>&1 | tee "$output_file" || true
+    docker sandbox run claude \
+      --permission-mode acceptEdits \
+      -p "$(cat "$prompt_file")" \
+      --model sonnet \
+      2>&1 | tee "$output_file" || true
+
+    rm -f "$prompt_file"
 
     # Check for COMPLETE signal
     if grep -q '<promise>COMPLETE</promise>' "$output_file" 2>/dev/null; then
@@ -355,17 +221,15 @@ ${prompt_content}"
     fi
     rm -f "$output_file"
 
-    # Safety net: if Claude made changes but forgot to commit, do it here
-    docker exec "$CONTAINER_NAME" bash -c "
-      cd /home/agent/repos/${REPO}
-      if [ -n \"\$(git status --porcelain)\" ]; then
-        echo '[sandcastle] Auto-committing uncommitted changes...'
-        git add -A
-        git commit -m 'RALPH: auto-commit uncommitted work from iteration ${i}'
-      fi
-      git pull origin '${BRANCH}' --rebase 2>&1 || true
-      git push origin '${BRANCH}' 2>&1 || true
-    " || true
+    # Safety net: auto-commit any uncommitted work
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+      echo '[sandcastle] Auto-committing uncommitted changes...'
+      git add -A
+      git commit -m "RALPH: auto-commit uncommitted work from iteration ${i}"
+    fi
+
+    # Push after each iteration
+    git push origin "${BRANCH}" 2>&1 || true
 
   done
 }
@@ -373,77 +237,45 @@ ${prompt_content}"
 # --- PR Creation ---
 
 create_pr() {
-  # Check if there are commits on the branch
   local commit_count
-  commit_count=$(docker exec "$CONTAINER_NAME" bash -c "
-    cd /home/agent/repos/${REPO}
-    git log origin/main..HEAD --oneline 2>/dev/null | wc -l || \
-    git log origin/develop..HEAD --oneline 2>/dev/null | wc -l || \
-    echo 0
-  " 2>/dev/null | tr -d '[:space:]')
+  commit_count=$(git log origin/main..HEAD --oneline 2>/dev/null | wc -l | tr -d '[:space:]')
 
   if [[ "$commit_count" -eq 0 ]]; then
     warn "No changes made. Skipping PR creation."
     return
   fi
 
-  # Determine target branch
   local target_branch="develop"
-  docker exec "$CONTAINER_NAME" bash -c "
-    cd /home/agent/repos/${REPO}
-    git ls-remote --heads origin develop | grep -q develop
-  " 2>/dev/null || target_branch="main"
+  git ls-remote --heads origin develop 2>/dev/null | grep -q develop || target_branch="main"
 
-  # Collect PR body data
-  local pr_title closed_issues commit_log
+  local pr_title
   if [[ -n "$MILESTONE_FILTER" ]]; then
     pr_title="[Ralph] ${MILESTONE_FILTER}"
   else
     pr_title="[Ralph] All issues — $(date +%Y-%m-%d)"
   fi
 
-  closed_issues=$(docker exec "$CONTAINER_NAME" bash -c "
-    cd /home/agent/repos/${REPO}
-    git log --grep='RALPH:' --oneline --format='%s' | grep -oP '#\d+' | sort -u | while read issue; do
-      echo \"- \${issue}\"
-    done
-  " 2>/dev/null || echo "- No issues referenced")
-
-  commit_log=$(docker exec "$CONTAINER_NAME" bash -c "
-    cd /home/agent/repos/${REPO}
-    git log --grep='RALPH:' --oneline --format='- %h %s' -20
-  " 2>/dev/null || echo "- No commits")
-
   # Push final state
-  docker exec "$CONTAINER_NAME" bash -c "
-    cd /home/agent/repos/${REPO}
-    git push origin '${BRANCH}' 2>/dev/null
-  " || die "Failed to push branch"
+  git push origin "${BRANCH}" 2>&1 || die "Failed to push branch"
 
   # Check for existing PR
   local existing_pr
-  existing_pr=$(docker exec "$CONTAINER_NAME" bash -c "
-    cd /home/agent/repos/${REPO}
-    gh pr list --head '${BRANCH}' --json url -q '.[0].url' 2>/dev/null
-  " 2>/dev/null)
+  existing_pr=$(gh pr list --head "${BRANCH}" --json url -q '.[0].url' 2>/dev/null || true)
 
   if [[ -n "$existing_pr" ]]; then
     info "PR already exists: ${existing_pr}"
     return
   fi
 
-  # Create PR
-  local pr_url
-  pr_url=$(docker exec "$CONTAINER_NAME" bash -c "
-    cd /home/agent/repos/${REPO}
-    gh pr create \
-      --title '${pr_title}' \
-      --base '${target_branch}' \
-      --head '${BRANCH}' \
-      --body '## Ralph Autonomous Run
+  local commit_log
+  commit_log=$(git log --grep='RALPH:' --oneline --format='- %h %s' -20 2>/dev/null || echo "- No commits")
 
-### Issues Referenced
-${closed_issues}
+  gh pr create \
+    --title "${pr_title}" \
+    --base "${target_branch}" \
+    --head "${BRANCH}" \
+    --body "$(cat <<EOF
+## Ralph Autonomous Run
 
 ### Commits
 ${commit_log}
@@ -453,13 +285,9 @@ ${commit_log}
 - Milestone: ${MILESTONE_FILTER:-all issues}
 
 ---
-_Generated by [sandcastle](https://github.com/derekc00/sandcastle)_'
-  " 2>/dev/null) || warn "PR creation failed"
-
-  if [[ -n "$pr_url" ]]; then
-    success "PR created: ${pr_url}"
-    echo "$pr_url"
-  fi
+_Generated by [sandcastle](https://github.com/derekc00/sandcastle)_
+EOF
+)" 2>&1 || warn "PR creation failed"
 }
 
 # --- Notification ---
@@ -467,14 +295,12 @@ _Generated by [sandcastle](https://github.com/derekc00/sandcastle)_'
 notify() {
   local title="$1"
   local message="$2"
-
-  # macOS notification
   if command -v osascript &>/dev/null; then
     osascript -e "display notification \"${message}\" with title \"Sandcastle\" subtitle \"${title}\"" 2>/dev/null || true
   fi
 }
 
-# --- CLI Parsing ---
+# --- CLI ---
 
 usage() {
   echo "Usage: sandcastle <command> [options]"
@@ -523,15 +349,11 @@ main() {
   preflight
 
   echo "Repo:       ${OWNER}/${REPO}"
-  echo "Container:  ${CONTAINER_NAME}"
   echo "Iterations: ${ITERATIONS}"
   echo ""
 
   pick_milestone
-
-  build_image
-  start_container
-  setup_repo
+  setup_branch
 
   run_loop
 
