@@ -127,9 +127,10 @@ pick_milestone() {
 setup_branch() {
   info "Setting up branch: ${BRANCH}"
 
-  # Create or checkout the ralph branch
-  if git ls-remote --heads origin "${BRANCH}" 2>/dev/null | grep -q "${BRANCH}"; then
-    git checkout "${BRANCH}" 2>/dev/null || git checkout -b "${BRANCH}" "origin/${BRANCH}"
+  git fetch origin 2>/dev/null || true
+
+  if git show-ref --verify "refs/remotes/origin/${BRANCH}" &>/dev/null; then
+    git checkout "${BRANCH}" 2>/dev/null || git checkout -b "${BRANCH}" --track "origin/${BRANCH}"
     git pull origin "${BRANCH}" --rebase 2>/dev/null || true
   else
     git checkout -b "${BRANCH}" 2>/dev/null || git checkout "${BRANCH}"
