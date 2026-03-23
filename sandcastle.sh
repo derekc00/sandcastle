@@ -62,8 +62,8 @@ preflight() {
   OWNER=$(gh repo view --json owner -q '.owner.login')
   GITHUB_TOKEN=$(gh auth token)
   GITHUB_REPO="${OWNER}/${REPO}"
-  IMAGE_NAME="sandcastle-${REPO}"
-  CONTAINER_NAME="sandcastle-${REPO}"
+  IMAGE_NAME="sandcastle-$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')"
+  CONTAINER_NAME="sandcastle-$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')"
 
   # Read iterations from config
   ITERATIONS=$(jq -r '.defaultIterations // 100' "$SANDCASTLE_DIR/config.json")
