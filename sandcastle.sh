@@ -208,6 +208,12 @@ start_container() {
   docker run "${docker_args[@]}" "$IMAGE_NAME" \
     || die "Failed to start container"
 
+  # Copy .claude.json into container (Claude Code needs it writable)
+  if [[ -f "$HOME/.claude.json" ]]; then
+    docker cp "$HOME/.claude.json" "${CONTAINER_NAME}:/home/agent/.claude.json"
+    docker exec "$CONTAINER_NAME" bash -c "chown agent:agent /home/agent/.claude.json 2>/dev/null || true"
+  fi
+
   success "Container started: ${CONTAINER_NAME}"
 }
 
