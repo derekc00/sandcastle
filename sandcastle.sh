@@ -184,9 +184,9 @@ start_container() {
     -e "GITHUB_REPO=${GITHUB_REPO}"
   )
 
-  # Pass Claude auth token extracted from keychain
+  # Pass Claude OAuth token (same env var Matt Pocock uses)
   if [[ -n "$claude_token" ]]; then
-    docker_args+=(-e "ANTHROPIC_API_KEY=${claude_token}")
+    docker_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${claude_token}")
     info "Using Claude subscription token from keychain"
   else
     warn "Could not extract Claude token from keychain — Claude may not be authenticated"
