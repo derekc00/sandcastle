@@ -61,12 +61,8 @@ preflight() {
   REPO=$(gh repo view --json name -q '.name')
   OWNER=$(gh repo view --json owner -q '.owner.login')
 
-  # Detect target branch for PRs and commit counting
-  if git ls-remote --heads origin develop 2>/dev/null | grep -q develop; then
-    TARGET_BRANCH="develop"
-  else
-    TARGET_BRANCH="main"
-  fi
+  # Detect target branch from GitHub's default branch metadata
+  TARGET_BRANCH=$(gh repo view --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null || echo "main")
 
   # Read config
   if [[ -f "$SANDCASTLE_DIR/config.json" ]]; then
@@ -161,6 +157,8 @@ setup_branch() {
     git checkout "${BRANCH}" 2>/dev/null || git checkout -b "${BRANCH}" --track "origin/${BRANCH}"
     git pull origin "${BRANCH}" --rebase 2>/dev/null || true
   else
+    # Create new branch from TARGET_BRANCH, not current HEAD
+    git checkout "origin/${TARGET_BRANCH}" 2>/dev/null || true
     git checkout -b "${BRANCH}" 2>/dev/null || git checkout "${BRANCH}"
   fi
 
@@ -287,13 +285,15 @@ Push your commits with 'git push origin ${BRANCH}'.
 If all tasks are complete, output <promise>COMPLETE</promise>.
 PROMPT_EOF
 
-    # Run Claude in Docker Sandbox — pipe prompt via stdin to avoid ARG_MAX
+    # Run Claude in Docker Sandbox — pipe prompt via stdin
+    # Claude -p reads stdin automatically when not a TTY, no '-' sentinel needed
     cat "$prompt_file" | docker sandbox run claude -- \
       --dangerously-skip-permissions \
       --model sonnet \
       --max-turns 75 \
-      -p - \
-      2>&1 | tee "$output_file" || true
+      -p \
+      2>&1 | tee "$output_file"
+    local agent_exit=$?
 
     rm -f "$prompt_file"
 
@@ -306,6 +306,13 @@ PROMPT_EOF
     if grep -qi 'authentication_error\|Failed to authenticate\|Not logged in\|Unauthorized\|401\|invalid_api_key' "$output_file" 2>/dev/null; then
       echo ""
       die "Authentication failed. Run 'docker sandbox run claude' to log in first, then retry."
+    fi
+
+    # Check for non-auth failures (sandbox errors, quota, bad flags)
+    if [[ "$agent_exit" -ne 0 ]] && [[ ! -s "$output_file" ]]; then
+      warn "Agent exited with code ${agent_exit} and produced no output. Possible sandbox or quota error."
+      warn "Stopping to avoid burning iterations on a broken setup."
+      break
     fi
 
     # Iteration summary
