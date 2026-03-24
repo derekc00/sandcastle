@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # sandcastle — autonomous AI development loop
-# Uses Docker Sandbox + ralph-loop plugin for iterative development
+# Uses Docker Sandbox + Claude Code to implement GitHub issues
 
 # Colors
 RED='\033[0;31m'
@@ -15,17 +15,23 @@ SANDCASTLE_DIR=".sandcastle"
 REPO=""
 OWNER=""
 BRANCH=""
+TARGET_BRANCH=""
 ITERATIONS=100
 MILESTONE=""
 MILESTONE_FILTER=""
 RUN_ALL=false
 DRY_RUN=false
 SINGLE_ISSUE=""
+WATCHER_PID=""
 
 # --- Cleanup on exit ---
 
 cleanup() {
-  pkill -P $$ 2>/dev/null || true
+  # Only kill the watcher, not all children
+  if [[ -n "$WATCHER_PID" ]]; then
+    kill "$WATCHER_PID" 2>/dev/null || true
+    wait "$WATCHER_PID" 2>/dev/null || true
+  fi
   rm -f .sandcastle/issues.json .sandcastle/ralph-commits.txt
 }
 trap cleanup EXIT INT TERM
@@ -54,6 +60,13 @@ preflight() {
 
   REPO=$(gh repo view --json name -q '.name')
   OWNER=$(gh repo view --json owner -q '.owner.login')
+
+  # Detect target branch for PRs and commit counting
+  if git ls-remote --heads origin develop 2>/dev/null | grep -q develop; then
+    TARGET_BRANCH="develop"
+  else
+    TARGET_BRANCH="main"
+  fi
 
   # Read config
   if [[ -f "$SANDCASTLE_DIR/config.json" ]]; then
@@ -136,9 +149,10 @@ pick_milestone() {
 setup_branch() {
   info "Setting up branch: ${BRANCH}"
 
-  # Stash any dirty state before switching branches
+  # Stash with a unique message so we only pop our own stash
+  local stash_msg="sandcastle-auto-stash-$$"
   if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-    git stash --include-untracked 2>/dev/null || true
+    git stash push --include-untracked -m "$stash_msg" 2>/dev/null || true
   fi
 
   git fetch origin 2>/dev/null || true
@@ -150,8 +164,10 @@ setup_branch() {
     git checkout -b "${BRANCH}" 2>/dev/null || git checkout "${BRANCH}"
   fi
 
-  # Restore stashed changes
-  git stash pop 2>/dev/null || true
+  # Only pop if we created the stash (check by message)
+  if git stash list 2>/dev/null | head -1 | grep -q "$stash_msg"; then
+    git stash pop 2>/dev/null || true
+  fi
 
   success "On branch ${BRANCH}"
 }
@@ -161,17 +177,15 @@ setup_branch() {
 prepare_context() {
   info "Preparing issue context..."
 
-  # Fetch issues (lightweight: number + title only)
-  local issue_args="--state open --json number,title,labels --limit 10"
-  if [[ -n "$MILESTONE_FILTER" ]]; then
-    issue_args="$issue_args --milestone \"${MILESTONE_FILTER}\""
-  fi
-
   local issues
+
   if [[ -n "$SINGLE_ISSUE" ]]; then
     issues=$(gh issue view "${SINGLE_ISSUE}" --json number,title,body,labels 2>/dev/null)
+  elif [[ -n "$MILESTONE_FILTER" ]]; then
+    # Safe: no eval, milestone passed as proper argument
+    issues=$(gh issue list --state open --json number,title,labels --limit 10 --milestone "${MILESTONE_FILTER}" 2>/dev/null)
   else
-    issues=$(eval "gh issue list ${issue_args}" 2>/dev/null)
+    issues=$(gh issue list --state open --json number,title,labels --limit 10 2>/dev/null)
   fi
 
   local commits
@@ -179,34 +193,11 @@ prepare_context() {
 
   # Write to .sandcastle/ (Docker sandbox mounts the working dir)
   echo "$issues" > .sandcastle/issues.json
-  echo "$commits" > .sandcastle/ralph-commits.txt
+  printf '%s' "$commits" > .sandcastle/ralph-commits.txt
 
   local issue_count
   issue_count=$(echo "$issues" | jq 'if type == "array" then length else 1 end' 2>/dev/null || echo "0")
   info "Issues: ${issue_count} | RALPH commits: $(echo "$commits" | wc -l | tr -d '[:space:]')"
-}
-
-# --- Build Prompt ---
-
-build_prompt() {
-  # Read the static prompt template
-  local prompt_content
-  prompt_content=$(cat "$SANDCASTLE_DIR/prompt.md")
-
-  # The prompt for /ralph-loop — Claude reads the files itself
-  cat <<EOF
-$prompt_content
-
-# CONTEXT FILES
-Read these files for current state:
-- .sandcastle/issues.json — open GitHub issues (use 'gh issue view #N' for full details)
-- .sandcastle/ralph-commits.txt — recent RALPH commits showing completed work
-
-ONLY WORK ON A SINGLE TASK.
-Use 'gh issue view #N' to read the full details of the issue you pick.
-Commit with RALPH: prefix. Close the issue when done.
-Push your commits with 'git push origin ${BRANCH}'.
-EOF
 }
 
 # --- Run Loop ---
@@ -261,21 +252,27 @@ run_loop() {
           local latest_file
           latest_file=$(git status --porcelain 2>/dev/null | tail -1 | sed 's/^...//')
           echo "  [${mins}m] ${changed} files changed — latest: ${latest_file}"
-          last_file_count="$changed"
+        elif [[ "$changed" -eq 0 ]] && [[ "$last_file_count" -gt 0 ]]; then
+          echo "  [${mins}m] working tree clean"
         elif [[ "$changed" -eq 0 ]] && [[ "$last_file_count" -eq 0 ]]; then
           echo "  [${mins}m] agent working..."
         fi
+        last_file_count="$changed"
       done
     ) &
-    local watcher_pid=$!
+    WATCHER_PID=$!
 
     # Build the full prompt by reading files (@ syntax doesn't work in -p mode)
-    local prompt_content issues_content commits_content full_prompt
+    local prompt_content issues_content commits_content
     prompt_content=$(cat "$SANDCASTLE_DIR/prompt.md")
     issues_content=$(cat .sandcastle/issues.json 2>/dev/null || echo "[]")
     commits_content=$(cat .sandcastle/ralph-commits.txt 2>/dev/null || echo "No RALPH commits yet")
 
-    full_prompt="${prompt_content}
+    # Write prompt to temp file, pipe via stdin to avoid ARG_MAX limits
+    local prompt_file
+    prompt_file=$(mktemp /tmp/sandcastle-prompt-XXXXXX.md)
+    cat > "$prompt_file" <<PROMPT_EOF
+${prompt_content}
 
 # OPEN ISSUES
 ${issues_content}
@@ -287,30 +284,26 @@ ONLY WORK ON A SINGLE TASK.
 Use 'gh issue view #N' to read the full details of the issue you pick.
 Commit with RALPH: prefix. Close the issue when done.
 Push your commits with 'git push origin ${BRANCH}'.
-If all tasks are complete, output <promise>COMPLETE</promise>."
+If all tasks are complete, output <promise>COMPLETE</promise>.
+PROMPT_EOF
 
-    # Write prompt to temp file to avoid shell arg length limits
-    local prompt_file
-    prompt_file=$(mktemp /tmp/sandcastle-prompt-XXXXXX.md)
-    echo "$full_prompt" > "$prompt_file"
-
-    # Run Claude in Docker Sandbox — one invocation per iteration
-    # Note: docker sandbox buffers -p output until completion
-    docker sandbox run claude -- \
+    # Run Claude in Docker Sandbox — pipe prompt via stdin to avoid ARG_MAX
+    cat "$prompt_file" | docker sandbox run claude -- \
       --dangerously-skip-permissions \
       --model sonnet \
       --max-turns 75 \
-      -p "$(cat "$prompt_file")" \
+      -p - \
       2>&1 | tee "$output_file" || true
 
     rm -f "$prompt_file"
 
     # Stop watcher
-    kill "$watcher_pid" 2>/dev/null || true
-    wait "$watcher_pid" 2>/dev/null || true
+    kill "$WATCHER_PID" 2>/dev/null || true
+    wait "$WATCHER_PID" 2>/dev/null || true
+    WATCHER_PID=""
 
     # Check for auth failure — don't keep looping if not authenticated
-    if grep -q 'authentication_error\|Failed to authenticate\|Not logged in' "$output_file" 2>/dev/null; then
+    if grep -qi 'authentication_error\|Failed to authenticate\|Not logged in\|Unauthorized\|401\|invalid_api_key' "$output_file" 2>/dev/null; then
       echo ""
       die "Authentication failed. Run 'docker sandbox run claude' to log in first, then retry."
     fi
@@ -389,16 +382,14 @@ post_loop() {
 # --- PR Creation ---
 
 create_pr() {
+  # Use detected target branch instead of hardcoded origin/main
   local commit_count
-  commit_count=$(git log origin/main..HEAD --oneline 2>/dev/null | wc -l | tr -d '[:space:]')
+  commit_count=$(git log "origin/${TARGET_BRANCH}..HEAD" --oneline 2>/dev/null | wc -l | tr -d '[:space:]')
 
   if [[ "$commit_count" -eq 0 ]]; then
     warn "No changes made. Skipping PR creation."
     return
   fi
-
-  local target_branch="develop"
-  git ls-remote --heads origin develop 2>/dev/null | grep -q develop || target_branch="main"
 
   local pr_title
   if [[ -n "$MILESTONE_FILTER" ]]; then
@@ -422,7 +413,7 @@ create_pr() {
 
   gh pr create \
     --title "${pr_title}" \
-    --base "${target_branch}" \
+    --base "${TARGET_BRANCH}" \
     --head "${BRANCH}" \
     --body "$(cat <<EOF
 ## Ralph Autonomous Run
