@@ -220,11 +220,17 @@ run_loop() {
   # The Stop hook intercepts exit and feeds the same prompt back.
   # Context persists between iterations (files + git history).
   # Output streams in real-time (it's a normal Claude session, not -p mode).
-  docker sandbox run claude \
+  # Write prompt to a temp file to avoid shell escaping issues
+  local prompt_file=".sandcastle/ralph-prompt.txt"
+  echo "/ralph-loop ${prompt} --max-iterations ${ITERATIONS} --completion-promise 'COMPLETE'" > "$prompt_file"
+
+  docker sandbox run claude -- \
     --dangerously-skip-permissions \
     --model sonnet \
-    -p "/ralph-loop ${prompt} --max-iterations ${ITERATIONS} --completion-promise 'COMPLETE'" \
+    -p "$(cat "$prompt_file")" \
     2>&1 || true
+
+  rm -f "$prompt_file"
 
   echo ""
   success "Ralph loop finished."
