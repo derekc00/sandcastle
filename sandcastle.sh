@@ -136,6 +136,11 @@ pick_milestone() {
 setup_branch() {
   info "Setting up branch: ${BRANCH}"
 
+  # Stash any dirty state before switching branches
+  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    git stash --include-untracked 2>/dev/null || true
+  fi
+
   git fetch origin 2>/dev/null || true
 
   if git show-ref --verify "refs/remotes/origin/${BRANCH}" &>/dev/null; then
@@ -144,6 +149,9 @@ setup_branch() {
   else
     git checkout -b "${BRANCH}" 2>/dev/null || git checkout "${BRANCH}"
   fi
+
+  # Restore stashed changes
+  git stash pop 2>/dev/null || true
 
   success "On branch ${BRANCH}"
 }
