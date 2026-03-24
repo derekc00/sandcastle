@@ -22,6 +22,14 @@ RUN_ALL=false
 DRY_RUN=false
 SINGLE_ISSUE=""
 
+# --- Cleanup on exit ---
+
+cleanup() {
+  pkill -P $$ 2>/dev/null || true
+  rm -f .sandcastle/issues.json .sandcastle/ralph-commits.txt
+}
+trap cleanup EXIT INT TERM
+
 # --- Helpers ---
 
 die() { echo -e "${RED}Error:${NC} $1" >&2; exit 1; }
@@ -217,8 +225,44 @@ run_loop() {
 
     info "Running agent..."
 
+    # Background file watcher — monitors git activity every 30s
+    # since docker sandbox buffers all -p output until completion
+    local last_commit_hash
+    last_commit_hash=$(git rev-parse HEAD 2>/dev/null || echo "none")
+    local last_file_count=0
+    (
+      while true; do
+        sleep 30
+        local elapsed=$(( SECONDS - iter_start ))
+        local mins=$(( elapsed / 60 ))
+
+        # Check for new commits
+        local current_hash
+        current_hash=$(git rev-parse HEAD 2>/dev/null || echo "none")
+        if [[ "$current_hash" != "$last_commit_hash" ]]; then
+          local new_msg
+          new_msg=$(git log --oneline -1 2>/dev/null)
+          echo -e "\033[0;32m  [${mins}m] NEW COMMIT: ${new_msg}\033[0m"
+          last_commit_hash="$current_hash"
+        fi
+
+        # Check for file changes
+        local changed
+        changed=$(git status --porcelain 2>/dev/null | wc -l | tr -d '[:space:]')
+        if [[ "$changed" -gt 0 ]] && [[ "$changed" -ne "$last_file_count" ]]; then
+          local latest_file
+          latest_file=$(git status --porcelain 2>/dev/null | tail -1 | sed 's/^...//')
+          echo -e "\033[0;33m  [${mins}m] ${changed} files changed — latest: ${latest_file}\033[0m"
+          last_file_count="$changed"
+        elif [[ "$changed" -eq 0 ]] && [[ "$last_file_count" -eq 0 ]]; then
+          echo -e "\033[0;34m  [${mins}m] agent working...\033[0m"
+        fi
+      done
+    ) &
+    local watcher_pid=$!
+
     # Run Claude in Docker Sandbox — one invocation per iteration
-    # Output streams in real-time via tee
+    # Note: docker sandbox buffers -p output until completion
     docker sandbox run claude -- \
       --dangerously-skip-permissions \
       --model sonnet \
@@ -229,6 +273,10 @@ Commit with RALPH: prefix. Close the issue when done. \
 Push your commits with 'git push origin ${BRANCH}'. \
 If all tasks are complete, output <promise>COMPLETE</promise>." \
       2>&1 | tee "$output_file" || true
+
+    # Stop watcher
+    kill "$watcher_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
 
     # Iteration summary
     local iter_elapsed=$(( SECONDS - iter_start ))
