@@ -196,44 +196,78 @@ EOF
 # --- Run Loop ---
 
 run_loop() {
-  local prompt
-  prompt=$(build_prompt)
+  local loop_start_time=$SECONDS
 
-  if [[ "$DRY_RUN" == true ]]; then
-    info "[DRY RUN] Would run ralph-loop with prompt:"
-    echo "$prompt" | head -20
-    echo "..."
-    return
-  fi
+  for i in $(seq 1 "$ITERATIONS"); do
+    echo ""
+    echo "=== Iteration ${i}/${ITERATIONS} === $(date '+%H:%M:%S') ==="
+    echo ""
 
-  echo ""
-  echo "=== Starting Ralph Loop ==="
-  echo ""
-  echo "Iterations: ${ITERATIONS}"
-  echo "Branch:     ${BRANCH}"
-  echo ""
-  info "Launching Docker sandbox with ralph-loop plugin..."
-  info "You'll see Claude's output in real-time below."
-  echo ""
+    # Refresh issues each iteration (reflects closed issues from prior iterations)
+    prepare_context
 
-  # Run Claude in Docker Sandbox — single session, ralph-loop plugin handles the loop
-  # The Stop hook intercepts exit and feeds the same prompt back.
-  # Context persists between iterations (files + git history).
-  # Output streams in real-time (it's a normal Claude session, not -p mode).
-  # Write prompt to a temp file to avoid shell escaping issues
-  local prompt_file=".sandcastle/ralph-prompt.txt"
-  echo "/ralph-loop ${prompt} --max-iterations ${ITERATIONS} --completion-promise 'COMPLETE'" > "$prompt_file"
+    if [[ "$DRY_RUN" == true ]]; then
+      info "[DRY RUN] Would run agent"
+      continue
+    fi
 
-  docker sandbox run claude -- \
-    --dangerously-skip-permissions \
-    --model sonnet \
-    -p "$(cat "$prompt_file")" \
-    2>&1 || true
+    local iter_start=$SECONDS
+    local output_file="/tmp/sandcastle-output-${i}.txt"
+    > "$output_file"
 
-  rm -f "$prompt_file"
+    info "Running agent..."
 
-  echo ""
-  success "Ralph loop finished."
+    # Run Claude in Docker Sandbox — one invocation per iteration
+    # Output streams in real-time via tee
+    docker sandbox run claude -- \
+      --dangerously-skip-permissions \
+      --model sonnet \
+      -p "@.sandcastle/prompt.md @.sandcastle/issues.json @.sandcastle/ralph-commits.txt \
+ONLY WORK ON A SINGLE TASK. \
+Use 'gh issue view #N' to read the full details of the issue you pick. \
+Commit with RALPH: prefix. Close the issue when done. \
+Push your commits with 'git push origin ${BRANCH}'. \
+If all tasks are complete, output <promise>COMPLETE</promise>." \
+      2>&1 | tee "$output_file" || true
+
+    # Iteration summary
+    local iter_elapsed=$(( SECONDS - iter_start ))
+    local iter_mins=$(( iter_elapsed / 60 ))
+    local iter_secs=$(( iter_elapsed % 60 ))
+    echo ""
+    info "Iteration ${i} completed in ${iter_mins}m ${iter_secs}s"
+
+    # Show recent commits
+    local new_commits
+    new_commits=$(git log --oneline -3 --since="$(( iter_elapsed + 10 )) seconds ago" 2>/dev/null || true)
+    if [[ -n "$new_commits" ]]; then
+      info "Recent commits:"
+      echo "$new_commits" | sed 's/^/  /'
+    fi
+
+    # Check for COMPLETE signal
+    if grep -q '<promise>COMPLETE</promise>' "$output_file" 2>/dev/null; then
+      rm -f "$output_file"
+      success "All tasks complete!"
+      break
+    fi
+    rm -f "$output_file"
+
+    # Auto-commit any uncommitted work
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+      warn "Auto-committing uncommitted changes..."
+      git add -A
+      git commit -m "RALPH: auto-commit work from iteration ${i}"
+    fi
+
+    # Push after each iteration
+    git push origin "${BRANCH}" 2>&1 || true
+
+    # Total elapsed
+    local total_elapsed=$(( SECONDS - loop_start_time ))
+    local total_mins=$(( total_elapsed / 60 ))
+    info "Total elapsed: ${total_mins}m | Next: iteration $((i + 1))/${ITERATIONS}"
+  done
 }
 
 # --- Post-Loop ---
@@ -385,7 +419,6 @@ main() {
 
   pick_milestone
   setup_branch
-  prepare_context
   run_loop
 
   if [[ "$DRY_RUN" != true ]]; then
