@@ -250,7 +250,7 @@ run_loop() {
         if [[ "$current_hash" != "$last_commit_hash" ]]; then
           local new_msg
           new_msg=$(git log --oneline -1 2>/dev/null)
-          echo -e "\033[0;32m  [${mins}m] NEW COMMIT: ${new_msg}\033[0m"
+          echo "  [${mins}m] ✓ NEW COMMIT: ${new_msg}"
           last_commit_hash="$current_hash"
         fi
 
@@ -260,10 +260,10 @@ run_loop() {
         if [[ "$changed" -gt 0 ]] && [[ "$changed" -ne "$last_file_count" ]]; then
           local latest_file
           latest_file=$(git status --porcelain 2>/dev/null | tail -1 | sed 's/^...//')
-          echo -e "\033[0;33m  [${mins}m] ${changed} files changed — latest: ${latest_file}\033[0m"
+          echo "  [${mins}m] ${changed} files changed — latest: ${latest_file}"
           last_file_count="$changed"
         elif [[ "$changed" -eq 0 ]] && [[ "$last_file_count" -eq 0 ]]; then
-          echo -e "\033[0;34m  [${mins}m] agent working...\033[0m"
+          echo "  [${mins}m] agent working..."
         fi
       done
     ) &
