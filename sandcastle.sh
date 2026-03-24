@@ -1,5 +1,8 @@
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
+# Note: -e intentionally omitted. The agent pipeline can exit non-zero
+# (e.g. Claude hits max-turns, timeout, etc.) and we need to handle that
+# gracefully rather than having bash kill the script before our checks run.
 
 # sandcastle — autonomous AI development loop
 # Uses Docker Sandbox + Claude Code to implement GitHub issues
@@ -27,12 +30,11 @@ WATCHER_PID=""
 # --- Cleanup on exit ---
 
 cleanup() {
-  # Only kill the watcher, not all children
   if [[ -n "$WATCHER_PID" ]]; then
     kill "$WATCHER_PID" 2>/dev/null || true
     wait "$WATCHER_PID" 2>/dev/null || true
   fi
-  rm -f .sandcastle/issues.json .sandcastle/ralph-commits.txt
+  rm -f ".sandcastle/issues-$$.json" ".sandcastle/ralph-commits-$$.txt"
 }
 trap cleanup EXIT INT TERM
 
@@ -145,26 +147,20 @@ pick_milestone() {
 setup_branch() {
   info "Setting up branch: ${BRANCH}"
 
-  # Stash with a unique message so we only pop our own stash
-  local stash_msg="sandcastle-auto-stash-$$"
+  # Require clean working tree to avoid contaminating the Ralph branch
   if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-    git stash push --include-untracked -m "$stash_msg" 2>/dev/null || true
+    die "Working tree is dirty. Commit or stash your changes before running sandcastle."
   fi
 
-  git fetch origin 2>/dev/null || true
+  git fetch origin || die "Failed to fetch from origin."
 
   if git show-ref --verify "refs/remotes/origin/${BRANCH}" &>/dev/null; then
-    git checkout "${BRANCH}" 2>/dev/null || git checkout -b "${BRANCH}" --track "origin/${BRANCH}"
+    git checkout "${BRANCH}" || git checkout -b "${BRANCH}" --track "origin/${BRANCH}"
     git pull origin "${BRANCH}" --rebase 2>/dev/null || true
   else
-    # Create new branch from TARGET_BRANCH, not current HEAD
-    git checkout "origin/${TARGET_BRANCH}" 2>/dev/null || true
-    git checkout -b "${BRANCH}" 2>/dev/null || git checkout "${BRANCH}"
-  fi
-
-  # Only pop if we created the stash (check by message)
-  if git stash list 2>/dev/null | head -1 | grep -q "$stash_msg"; then
-    git stash pop 2>/dev/null || true
+    # Create new branch from TARGET_BRANCH
+    git checkout -b "${BRANCH}" "origin/${TARGET_BRANCH}" \
+      || die "Failed to create branch ${BRANCH} from origin/${TARGET_BRANCH}. Does origin/${TARGET_BRANCH} exist?"
   fi
 
   success "On branch ${BRANCH}"
@@ -190,8 +186,8 @@ prepare_context() {
   commits=$(git log --grep='RALPH:' --oneline -10 --format='%h %ad %s' --date=short 2>/dev/null || echo "No RALPH commits yet")
 
   # Write to .sandcastle/ (Docker sandbox mounts the working dir)
-  echo "$issues" > .sandcastle/issues.json
-  printf '%s' "$commits" > .sandcastle/ralph-commits.txt
+  echo "$issues" > .sandcastle/issues-$$.json
+  printf '%s' "$commits" > .sandcastle/ralph-commits-$$.txt
 
   local issue_count
   issue_count=$(echo "$issues" | jq 'if type == "array" then length else 1 end' 2>/dev/null || echo "0")
@@ -263,8 +259,8 @@ run_loop() {
     # Build the full prompt by reading files (@ syntax doesn't work in -p mode)
     local prompt_content issues_content commits_content
     prompt_content=$(cat "$SANDCASTLE_DIR/prompt.md")
-    issues_content=$(cat .sandcastle/issues.json 2>/dev/null || echo "[]")
-    commits_content=$(cat .sandcastle/ralph-commits.txt 2>/dev/null || echo "No RALPH commits yet")
+    issues_content=$(cat .sandcastle/issues-$$.json 2>/dev/null || echo "[]")
+    commits_content=$(cat .sandcastle/ralph-commits-$$.txt 2>/dev/null || echo "No RALPH commits yet")
 
     # Write prompt to temp file, pipe via stdin to avoid ARG_MAX limits
     local prompt_file
@@ -359,7 +355,7 @@ PROMPT_EOF
 
 post_loop() {
   # Clean up temp files
-  rm -f .sandcastle/issues.json .sandcastle/ralph-commits.txt
+  rm -f .sandcastle/issues-$$.json .sandcastle/ralph-commits-$$.txt
 
   # Auto-commit any leftover uncommitted work (skip hooks)
   if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
