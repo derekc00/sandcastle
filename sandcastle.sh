@@ -261,18 +261,41 @@ run_loop() {
     ) &
     local watcher_pid=$!
 
+    # Build the full prompt by reading files (@ syntax doesn't work in -p mode)
+    local prompt_content issues_content commits_content full_prompt
+    prompt_content=$(cat "$SANDCASTLE_DIR/prompt.md")
+    issues_content=$(cat .sandcastle/issues.json 2>/dev/null || echo "[]")
+    commits_content=$(cat .sandcastle/ralph-commits.txt 2>/dev/null || echo "No RALPH commits yet")
+
+    full_prompt="${prompt_content}
+
+# OPEN ISSUES
+${issues_content}
+
+# RECENT RALPH COMMITS
+${commits_content}
+
+ONLY WORK ON A SINGLE TASK.
+Use 'gh issue view #N' to read the full details of the issue you pick.
+Commit with RALPH: prefix. Close the issue when done.
+Push your commits with 'git push origin ${BRANCH}'.
+If all tasks are complete, output <promise>COMPLETE</promise>."
+
+    # Write prompt to temp file to avoid shell arg length limits
+    local prompt_file
+    prompt_file=$(mktemp /tmp/sandcastle-prompt-XXXXXX.md)
+    echo "$full_prompt" > "$prompt_file"
+
     # Run Claude in Docker Sandbox — one invocation per iteration
     # Note: docker sandbox buffers -p output until completion
     docker sandbox run claude -- \
       --dangerously-skip-permissions \
       --model sonnet \
-      -p "@.sandcastle/prompt.md @.sandcastle/issues.json @.sandcastle/ralph-commits.txt \
-ONLY WORK ON A SINGLE TASK. \
-Use 'gh issue view #N' to read the full details of the issue you pick. \
-Commit with RALPH: prefix. Close the issue when done. \
-Push your commits with 'git push origin ${BRANCH}'. \
-If all tasks are complete, output <promise>COMPLETE</promise>." \
+      --max-turns 75 \
+      -p "$(cat "$prompt_file")" \
       2>&1 | tee "$output_file" || true
+
+    rm -f "$prompt_file"
 
     # Stop watcher
     kill "$watcher_pid" 2>/dev/null || true
